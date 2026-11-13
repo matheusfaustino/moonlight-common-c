@@ -280,7 +280,13 @@ static void VideoReceiveThreadProc(void* context) {
             // Alternate which socket wins when both are readable so a busy primary can't starve the secondary
             struct pollfd pfds[2] = { { rtpSocket, POLLIN, 0 }, { secondarySocket, POLLIN, 0 } };
             preferSecondary = !preferSecondary;
-            if (pollSockets(pfds, 2, UDP_RECV_POLL_TIMEOUT_MS) <= 0) {
+            int pollErr = pollSockets(pfds, 2, UDP_RECV_POLL_TIMEOUT_MS);
+            if (pollErr < 0) {
+                Limelog("multilink: poll failed (%d), continuing on primary\n", (int)LastSocketError());
+                atomic_store(&secondaryFailed, true);
+                continue;
+            }
+            else if (pollErr == 0) {
                 recvSocket = INVALID_SOCKET;
             }
             else if (pfds[1].revents && (preferSecondary || !pfds[0].revents)) {
@@ -322,14 +328,16 @@ static void VideoReceiveThreadProc(void* context) {
             continue;
         }
 
-        if (!atomic_exchange_explicit(&receivedDataFromPeer, true, memory_order_relaxed)) {
+        // Only the primary path counts as the peer being alive, so stray packets on the
+        // secondary can't defeat the no-video-traffic timeouts.
+        if (path == 0 && !atomic_exchange_explicit(&receivedDataFromPeer, true, memory_order_relaxed)) {
             Limelog("Received first video packet after %d ms\n", waitingForVideoMs);
 
             firstDataTimeMs = PltGetMillis();
         }
 
 #ifndef LC_FUZZING
-        if (!receivedFullFrame) {
+        if (path == 0 && !receivedFullFrame) {
             if (PltGetMillis() - firstDataTimeMs >= FIRST_FRAME_TIMEOUT_SEC * 1000) {
                 Limelog("Terminating connection due to lack of a successful video frame\n");
                 ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_FRAME);
@@ -383,8 +391,12 @@ static void VideoReceiveThreadProc(void* context) {
                                    encHeader->tag, sizeof(encHeader->tag),
                                    ((unsigned char*)(encHeader + 1)), err - sizeof(ENC_VIDEO_HEADER), // The ciphertext is after the header
                                    (unsigned char*)buffer, &err)) {
-                Limelog("Failed to decrypt video packet!\n");
-                pathStats[path].decryptFailures++;
+                // Bounded: a flood of bad packets on either path must not flood the log
+                uint64_t failures = ++pathStats[path].decryptFailures;
+                if ((failures & (failures - 1)) == 0) {
+                    Limelog("Failed to decrypt video packet on path %d (%llu so far)\n", path,
+                            (unsigned long long)failures);
+                }
                 continue;
             }
         }
@@ -478,6 +490,7 @@ void stopVideoStream(void) {
         firstFrameSocket = INVALID_SOCKET;
     }
     if (secondarySocket != INVALID_SOCKET) {
+        RtpvMultilinkFlush(&rtpQueue);
         logMultilinkSummary("final");
         closeSocket(secondarySocket);
         secondarySocket = INVALID_SOCKET;
