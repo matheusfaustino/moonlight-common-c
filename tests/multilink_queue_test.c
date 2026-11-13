@@ -46,32 +46,59 @@ static int feed(uint32_t frame, uint32_t shard, int path) {
 
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); return 1; } } while (0)
 
+#define CNT(u, r, f, n) (q.blocksPrimaryAloneUnrecoverable == (u) && q.blocksRescuedBySecondary == (r) && \
+                         q.blocksFailedMerged == (f) && q.blocksUnfinalized == (n))
+
 int main(void) {
     StreamConfig.packetSize = 16;
     RtpvInitializeQueue(&q);
 
     for (int i = 0; i < DATA; i++) feed(1, i, 0);                       // primary alone is enough
-    feed(2, 0, 0); feed(2, 1, 0); feed(2, 3, 0); feed(2, 2, 1);         // secondary fills the hole
-    feed(3, 0, 0); feed(3, 1, 0); feed(3, 2, 1);                        // shard 3 lost on both
-    feed(4, 0, 1);                                                      // next frame abandons frame 3
-    CHECK(q.blocksPrimaryAloneUnrecoverable == 2 && q.blocksRescuedBySecondary == 1 && q.blocksFailedMerged == 1);
+    CHECK(CNT(0, 0, 0, 0));
 
-    // Frame 4: secondary wins shard 0, the primary copy is a rejected duplicate but still counts for the primary
-    CHECK(feed(4, 0, 0) == RTPF_RET_REJECTED);
-    feed(4, 1, 0); feed(4, 2, 0); feed(4, 3, 0);
-    CHECK(q.blocksPrimaryAloneUnrecoverable == 2);
-    CHECK(delivered == 3 * DATA);
+    // Frame 2: secondary fills the hole. Frame 3 then completes on the secondary alone;
+    // the primary has not advanced, so frame 2 must not be decided yet.
+    feed(2, 0, 0); feed(2, 1, 0); feed(2, 3, 0); feed(2, 2, 1);
+    for (int i = 0; i < DATA; i++) feed(3, i, 1);
+    CHECK(CNT(0, 0, 0, 0));
+    feed(3, 0, 0);                                                      // primary moves past frame 2
+    CHECK(CNT(1, 1, 0, 0));
+    for (int i = 1; i < DATA; i++) CHECK(feed(3, i, 0) == RTPF_RET_REJECTED);
+    CHECK(CNT(1, 1, 0, 0));                                             // late primary copies: frame 3 was primary-complete
 
-    // Frame 5: secondary wins the last shard, then the primary copy arrives late: not a rescue
-    feed(5, 0, 0); feed(5, 1, 0); feed(5, 2, 0); feed(5, 3, 1);
-    CHECK(feed(5, 3, 0) == RTPF_RET_REJECTED);
+    // Frame 4: secondary wins the last shard; the late primary copy is observed (frame 4 is
+    // already complete) and passes the stale-frame filter, so it is not counted as a rescue.
+    feed(4, 0, 0); feed(4, 1, 0); feed(4, 2, 0); feed(4, 3, 1);
+    CHECK(!RtpvIsStaleFrame(&q, 4, 0, true));
+    CHECK(feed(4, 3, 0) == RTPF_RET_REJECTED);
+    feed(5, 0, 0); feed(5, 1, 0);
+    CHECK(CNT(1, 1, 0, 0));
+
+    // Stale-frame filter: secondary and non-multilink drop it, old primary frames drop it
+    CHECK(RtpvIsStaleFrame(&q, 4, 1, true));
+    CHECK(RtpvIsStaleFrame(&q, 4, 0, false));
+    CHECK(!RtpvIsStaleFrame(&q, 5, 1, true));
+    CHECK(!RtpvIsStaleFrame(&q, 0, 1, true));
+    CHECK(RtpvIsStaleFrame(&q, 4, 0, true) == false && q.currentFrameNumber - 4 <= ML_RING_BLOCKS);
+
+    // Frame 5: primary only delivers shards 0,1; secondary completes it. Frame 6 loses
+    // shard 3 on both paths and is abandoned by frame 7.
+    feed(5, 2, 1); feed(5, 3, 1);
+    feed(6, 0, 0); feed(6, 1, 0); feed(6, 2, 0);
+    feed(7, 0, 1);
+    CHECK(CNT(2, 2, 0, 0));                                             // frame 5 decided; primary still on frame 6
+    feed(7, 0, 0);
+    CHECK(CNT(3, 2, 1, 0));
+
+    // Frames 7..14 on the secondary alone; the primary stays silent. Frame 7 is evicted
+    // from the ring after 8 newer blocks and is unfinalized, not rescued.
+    for (int i = 1; i < DATA; i++) feed(7, i, 1);
+    for (uint32_t f = 8; f <= 14; f++) for (int i = 0; i < DATA; i++) feed(f, i, 1);
+    CHECK(CNT(3, 2, 1, 0));
+    feed(15, 0, 1);
+    CHECK(CNT(3, 2, 1, 1));
     RtpvMultilinkFlush(&q);
-    CHECK(q.blocksPrimaryAloneUnrecoverable == 2 && q.blocksRescuedBySecondary == 1 && q.blocksFailedMerged == 1);
-
-    // Frame 6: the primary never delivers shard 3, so flush counts a rescue
-    feed(6, 0, 0); feed(6, 1, 0); feed(6, 2, 0); feed(6, 3, 1);
-    RtpvMultilinkFlush(&q);
-    CHECK(q.blocksPrimaryAloneUnrecoverable == 3 && q.blocksRescuedBySecondary == 2 && q.blocksFailedMerged == 1);
+    CHECK(CNT(3, 2, 1, 9));
 
     RtpvCleanupQueue(&q);
     printf("ok\n");

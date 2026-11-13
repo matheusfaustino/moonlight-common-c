@@ -137,7 +137,7 @@ static void logMultilinkSummary(const char* tag) {
     RtpvGetStats(&rtpQueue, &stats);
     Limelog("multilink %s: p0 pkts=%llu bytes=%llu decfail=%llu first=%llu dup_late=%llu | "
             "p1 pkts=%llu bytes=%llu decfail=%llu first=%llu dup_late=%llu | "
-            "blocks_primary_alone_unrecoverable=%u blocks_rescued_by_secondary=%u blocks_failed_merged=%u | "
+            "blocks_primary_alone_unrecoverable=%u blocks_rescued_by_secondary=%u blocks_failed_merged=%u blocks_unfinalized=%u | "
             "fec_recovered=%u fec_failed=%u oos=%u%s\n",
             tag,
             (unsigned long long)pathStats[0].packets, (unsigned long long)pathStats[0].bytes,
@@ -147,7 +147,7 @@ static void logMultilinkSummary(const char* tag) {
             (unsigned long long)pathStats[1].decryptFailures, (unsigned long long)pathStats[1].accepted,
             (unsigned long long)pathStats[1].rejected,
             rtpQueue.blocksPrimaryAloneUnrecoverable, rtpQueue.blocksRescuedBySecondary,
-            rtpQueue.blocksFailedMerged, stats.packetCountFecRecovered, stats.packetCountFecFailed,
+            rtpQueue.blocksFailedMerged, rtpQueue.blocksUnfinalized, stats.packetCountFecRecovered, stats.packetCountFecFailed,
             stats.packetCountOOS, atomic_load(&secondaryFailed) ? " secondary=failed" : "");
 }
 
@@ -379,7 +379,10 @@ static void VideoReceiveThreadProc(void* context) {
             // couldn't already do. If they're not on-link, we just throw their malicious
             // traffic away (as mentioned in the paragraph above) and continue accepting
             // legitmate video traffic.
-            if (encHeader->frameNumber && LE32(encHeader->frameNumber) < RtpvGetCurrentFrameNumber(&rtpQueue)) {
+            //
+            // With multilink, recent primary copies are still decrypted so the counterfactual
+            // counters see them even when the secondary copy already completed the frame.
+            if (RtpvIsStaleFrame(&rtpQueue, LE32(encHeader->frameNumber), path, secondarySocket != INVALID_SOCKET)) {
                 pathStats[path].rejected++;
                 continue;
             }

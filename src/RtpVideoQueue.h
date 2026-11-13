@@ -21,6 +21,21 @@ typedef struct _RTPV_QUEUE_LIST {
     uint32_t count;
 } RTPV_QUEUE_LIST, *PRTPV_QUEUE_LIST;
 
+// A block is evaluated only after the primary has moved past it, or is unfinalized
+// once ML_RING_BLOCKS newer blocks have started.
+#define ML_RING_BLOCKS 8
+
+typedef struct _ML_BLOCK {
+    bool used;
+    bool resolved;      // merged queue completed it or moved on to a newer block
+    bool completed;     // merged queue completed it
+    uint16_t lowest;
+    uint16_t highest;
+    uint16_t dataShards;
+    uint16_t seenCount;
+    uint8_t seen[32];
+} ML_BLOCK;
+
 typedef struct _RTP_VIDEO_QUEUE_STATS {
     atomic_uint packetCountVideo;
     atomic_uint packetCountFec;
@@ -59,16 +74,17 @@ typedef struct _RTP_VIDEO_QUEUE {
     uint64_t lastOosFramePresentationTimestamp;
     bool receivedOosData;
 
-    // Multilink counterfactual: which shards of the current FEC block the primary
-    // path delivered (even if the secondary copy won the race), plus lifetime
-    // per-block counters. Only touched from the receive thread.
-    uint8_t primarySeen[32];
-    uint32_t primarySeenCount;
-    bool multilinkBlockOpen;      // a block is tracked and not yet counted
-    bool multilinkBlockCompleted; // the open block was completed by the merged queue
+    // Multilink counterfactual: a small ring of recent FEC blocks records which shards
+    // the primary path delivered, independent of which copy the merged queue used.
+    // Only touched from the receive thread.
+    ML_BLOCK mlRing[ML_RING_BLOCKS];
+    uint32_t mlNext;              // blocks started so far; slot = mlNext % ML_RING_BLOCKS
+    bool mlHavePrimary;
+    uint16_t mlPrimaryHigh;       // highest sequence number the primary delivered
     uint32_t blocksPrimaryAloneUnrecoverable;
     uint32_t blocksRescuedBySecondary;
     uint32_t blocksFailedMerged;
+    uint32_t blocksUnfinalized;   // primary never moved past the block within the ring window
 
     RTP_VIDEO_QUEUE_STATS stats; // the above values are short-lived, this tracks stats for the life of the queue
 } RTP_VIDEO_QUEUE, *PRTP_VIDEO_QUEUE;
@@ -82,6 +98,9 @@ void RtpvCleanupQueue(PRTP_VIDEO_QUEUE queue);
 int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry, int path);
 uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue);
 void RtpvSubmitQueuedPackets(PRTP_VIDEO_QUEUE queue);
-// Counts the open block if the merged queue completed it. Call at stream end.
+// Finalizes (or marks unfinalized) every tracked block. Call at stream end.
 void RtpvMultilinkFlush(PRTP_VIDEO_QUEUE queue);
+// Pre-decrypt stale check: true if a packet of this frame can be dropped. Primary
+// copies stay eligible for ML_RING_BLOCKS frames so late ones are still observed.
+bool RtpvIsStaleFrame(PRTP_VIDEO_QUEUE queue, uint32_t frameNumber, int path, bool multilink);
 void RtpvGetStats(PRTP_VIDEO_QUEUE queue, PRTP_VIDEO_STATS stats);

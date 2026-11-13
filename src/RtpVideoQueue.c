@@ -108,30 +108,77 @@ static void reportFinalFrameFecStatus(PRTP_VIDEO_QUEUE queue) {
     connectionSendFrameFecStatus(&fecStatus);
 }
 
-// Counts the open block once it is closed (the next block starts), so late primary
-// copies of its shards are still seen. A block the primary path alone could not have
-// completed counts as rescued if the merged queue completed it, otherwise as failed.
-static void multilinkBlockEnd(PRTP_VIDEO_QUEUE queue) {
-    bool open = queue->multilinkBlockOpen;
-    queue->multilinkBlockOpen = false;
-    if (!open || queue->primarySeenCount >= queue->bufferDataPackets) {
+static bool mlPrimaryPast(PRTP_VIDEO_QUEUE queue, ML_BLOCK* b) {
+    return queue->mlHavePrimary && isBefore16(b->highest, queue->mlPrimaryHigh);
+}
+
+// Counts a block the primary alone could not have completed. It is only decided once
+// the primary has moved past it (so late primary copies were seen) and the merged
+// queue is done with it; force (eviction or stream end) leaves it unfinalized instead.
+static void mlFinalize(PRTP_VIDEO_QUEUE queue, ML_BLOCK* b, bool force) {
+    if (!b->used) {
         return;
     }
-    queue->blocksPrimaryAloneUnrecoverable++;
-    if (queue->multilinkBlockCompleted) {
-        queue->blocksRescuedBySecondary++;
+    if (b->seenCount >= b->dataShards) {
+        b->used = false;
     }
-    else {
-        queue->blocksFailedMerged++;
+    else if (b->resolved && mlPrimaryPast(queue, b)) {
+        b->used = false;
+        queue->blocksPrimaryAloneUnrecoverable++;
+        if (b->completed) {
+            queue->blocksRescuedBySecondary++;
+        }
+        else {
+            queue->blocksFailedMerged++;
+        }
+    }
+    else if (force) {
+        b->used = false;
+        queue->blocksUnfinalized++;
     }
 }
 
-static void markPrimaryShard(PRTP_VIDEO_QUEUE queue, uint16_t sequenceNumber) {
-    uint16_t shard = U16(sequenceNumber - queue->bufferLowestSequenceNumber);
-    if (shard < sizeof(queue->primarySeen) * 8 && !(queue->primarySeen[shard / 8] & (1 << (shard % 8)))) {
-        queue->primarySeen[shard / 8] |= 1 << (shard % 8);
-        queue->primarySeenCount++;
+static void mlFinalizeReady(PRTP_VIDEO_QUEUE queue) {
+    for (int i = 0; i < ML_RING_BLOCKS; i++) {
+        mlFinalize(queue, &queue->mlRing[i], false);
     }
+}
+
+static void mlMarkPrimary(PRTP_VIDEO_QUEUE queue, uint16_t sequenceNumber) {
+    for (int i = 0; i < ML_RING_BLOCKS; i++) {
+        ML_BLOCK* b = &queue->mlRing[i];
+        if (!b->used || isBefore16(sequenceNumber, b->lowest) || isBefore16(b->highest, sequenceNumber)) {
+            continue;
+        }
+        uint16_t shard = U16(sequenceNumber - b->lowest);
+        if (shard < sizeof(b->seen) * 8 && !(b->seen[shard / 8] & (1 << (shard % 8)))) {
+            b->seen[shard / 8] |= 1 << (shard % 8);
+            b->seenCount++;
+        }
+        return;
+    }
+}
+
+// Starts tracking the block the merged queue just opened.
+static void mlStartBlock(PRTP_VIDEO_QUEUE queue) {
+    ML_BLOCK* cur = &queue->mlRing[(queue->mlNext + ML_RING_BLOCKS - 1) % ML_RING_BLOCKS];
+    cur->resolved = true;
+    mlFinalizeReady(queue);
+
+    ML_BLOCK* b = &queue->mlRing[queue->mlNext++ % ML_RING_BLOCKS];
+    mlFinalize(queue, b, true);
+    memset(b, 0, sizeof(*b));
+    b->used = true;
+    b->lowest = queue->bufferLowestSequenceNumber;
+    b->highest = queue->bufferHighestSequenceNumber;
+    b->dataShards = queue->bufferDataPackets;
+}
+
+bool RtpvIsStaleFrame(PRTP_VIDEO_QUEUE queue, uint32_t frameNumber, int path, bool multilink) {
+    if (!frameNumber || frameNumber >= queue->currentFrameNumber) {
+        return false;
+    }
+    return !(multilink && path == 0 && queue->currentFrameNumber - frameNumber <= ML_RING_BLOCKS);
 }
 
 // newEntry is contained within the packet buffer so we free the whole entry by freeing entry->packet
@@ -568,12 +615,15 @@ uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue) {
 }
 
 int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry, int path) {
-    // A primary copy of a shard in the tracked block counts for the counterfactual even
-    // when the secondary copy won and this one is about to be rejected as a duplicate or late.
-    if (path == 0 && queue->multilinkBlockOpen &&
-            !isBefore16(packet->sequenceNumber, queue->bufferLowestSequenceNumber) &&
-            !isBefore16(queue->bufferHighestSequenceNumber, packet->sequenceNumber)) {
-        markPrimaryShard(queue, packet->sequenceNumber);
+    // A primary copy counts for the counterfactual even when the secondary copy won
+    // and this one is about to be rejected as a duplicate or late.
+    if (path == 0) {
+        mlMarkPrimary(queue, packet->sequenceNumber);
+        if (!queue->mlHavePrimary || isBefore16(queue->mlPrimaryHigh, packet->sequenceNumber)) {
+            queue->mlPrimaryHigh = packet->sequenceNumber;
+            queue->mlHavePrimary = true;
+        }
+        mlFinalizeReady(queue);
     }
 
     if (isBefore16(packet->sequenceNumber, queue->nextContiguousSequenceNumber)) {
@@ -731,11 +781,6 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         connectionSawFrame(queue->currentFrameNumber);
 
         queue->bufferFirstRecvTimeUs = PltGetMicroseconds();
-        multilinkBlockEnd(queue);
-        memset(queue->primarySeen, 0, sizeof(queue->primarySeen));
-        queue->primarySeenCount = 0;
-        queue->multilinkBlockOpen = true;
-        queue->multilinkBlockCompleted = false;
         queue->bufferLowestSequenceNumber = U16(packet->sequenceNumber - fecIndex);
         queue->nextContiguousSequenceNumber = queue->bufferLowestSequenceNumber;
         queue->receivedDataPackets = 0;
@@ -751,6 +796,10 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         queue->bufferHighestSequenceNumber = U16(queue->bufferFirstParitySequenceNumber + queue->bufferParityPackets - 1);
         queue->multiFecCurrentBlockNumber = fecCurrentBlockNumber;
         queue->multiFecLastBlockNumber = (nvPacket->multiFecBlocks >> 6) & 0x3;
+        mlStartBlock(queue);
+        if (path == 0) {
+            mlMarkPrimary(queue, packet->sequenceNumber);
+        }
 
         atomic_fetch_add_explicit(&queue->stats.packetCountVideo, queue->bufferDataPackets, memory_order_relaxed);
         atomic_fetch_add_explicit(&queue->stats.packetCountFec, queue->bufferParityPackets, memory_order_relaxed);
@@ -759,10 +808,6 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
     // Reject packets above our FEC queue valid sequence number range
     if (isBefore16(queue->bufferHighestSequenceNumber, packet->sequenceNumber)) {
         return RTPF_RET_REJECTED;
-    }
-
-    if (path == 0) {
-        markPrimaryShard(queue, packet->sequenceNumber);
     }
 
     LC_ASSERT_VT(!queue->fecPercentage || U16(packet->sequenceNumber - fecIndex) == queue->bufferLowestSequenceNumber);
@@ -818,7 +863,9 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         // Try to submit this frame. If we haven't received enough packets,
         // this will fail and we'll keep waiting.
         if (reconstructFrame(queue) == 0) {
-            queue->multilinkBlockCompleted = true;
+            ML_BLOCK* done = &queue->mlRing[(queue->mlNext + ML_RING_BLOCKS - 1) % ML_RING_BLOCKS];
+            done->completed = true;
+            done->resolved = true;
 
             // Stage the complete FEC block for use once reassembly is complete
             stageCompleteFecBlock(queue);
@@ -854,8 +901,8 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
 }
 
 void RtpvMultilinkFlush(PRTP_VIDEO_QUEUE queue) {
-    if (queue->multilinkBlockCompleted) {
-        multilinkBlockEnd(queue);
+    for (int i = 0; i < ML_RING_BLOCKS; i++) {
+        mlFinalize(queue, &queue->mlRing[i], true);
     }
 }
 
