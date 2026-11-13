@@ -64,6 +64,8 @@ typedef struct _RTP_VIDEO_QUEUE {
     // per-block counters. Only touched from the receive thread.
     uint8_t primarySeen[32];
     uint32_t primarySeenCount;
+    bool multilinkBlockOpen;      // a block is tracked and not yet counted
+    bool multilinkBlockCompleted; // the open block was completed by the merged queue
     uint32_t blocksPrimaryAloneUnrecoverable;
     uint32_t blocksRescuedBySecondary;
     uint32_t blocksFailedMerged;
@@ -80,4 +82,6 @@ void RtpvCleanupQueue(PRTP_VIDEO_QUEUE queue);
 int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry, int path);
 uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue);
 void RtpvSubmitQueuedPackets(PRTP_VIDEO_QUEUE queue);
+// Counts the open block if the merged queue completed it. Call at stream end.
+void RtpvMultilinkFlush(PRTP_VIDEO_QUEUE queue);
 void RtpvGetStats(PRTP_VIDEO_QUEUE queue, PRTP_VIDEO_STATS stats);

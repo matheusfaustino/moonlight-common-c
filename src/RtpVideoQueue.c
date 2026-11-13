@@ -108,15 +108,17 @@ static void reportFinalFrameFecStatus(PRTP_VIDEO_QUEUE queue) {
     connectionSendFrameFecStatus(&fecStatus);
 }
 
-// Called once per FEC block when it completes or is abandoned. A block the primary
-// path alone could not have completed counts as rescued if the merged queue
-// completed it, otherwise as failed.
-static void multilinkBlockEnd(PRTP_VIDEO_QUEUE queue, bool completed) {
-    if (queue->primarySeenCount >= queue->bufferDataPackets) {
+// Counts the open block once it is closed (the next block starts), so late primary
+// copies of its shards are still seen. A block the primary path alone could not have
+// completed counts as rescued if the merged queue completed it, otherwise as failed.
+static void multilinkBlockEnd(PRTP_VIDEO_QUEUE queue) {
+    bool open = queue->multilinkBlockOpen;
+    queue->multilinkBlockOpen = false;
+    if (!open || queue->primarySeenCount >= queue->bufferDataPackets) {
         return;
     }
     queue->blocksPrimaryAloneUnrecoverable++;
-    if (completed) {
+    if (queue->multilinkBlockCompleted) {
         queue->blocksRescuedBySecondary++;
     }
     else {
@@ -566,13 +568,15 @@ uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue) {
 }
 
 int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry, int path) {
+    // A primary copy of a shard in the tracked block counts for the counterfactual even
+    // when the secondary copy won and this one is about to be rejected as a duplicate or late.
+    if (path == 0 && queue->multilinkBlockOpen &&
+            !isBefore16(packet->sequenceNumber, queue->bufferLowestSequenceNumber) &&
+            !isBefore16(queue->bufferHighestSequenceNumber, packet->sequenceNumber)) {
+        markPrimaryShard(queue, packet->sequenceNumber);
+    }
+
     if (isBefore16(packet->sequenceNumber, queue->nextContiguousSequenceNumber)) {
-        // Reject packets behind our current buffer window. A primary copy of a shard the
-        // secondary already delivered lands here and still counts for the counterfactual.
-        if (path == 0 && queue->pendingFecBlockList.count != 0 &&
-                !isBefore16(packet->sequenceNumber, queue->bufferLowestSequenceNumber)) {
-            markPrimaryShard(queue, packet->sequenceNumber);
-        }
         return RTPF_RET_REJECTED;
     }
 
@@ -625,7 +629,6 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         if (queue->pendingFecBlockList.count != 0) {
             // Report the final status of the FEC queue before dropping this frame
             reportFinalFrameFecStatus(queue);
-            multilinkBlockEnd(queue, false);
 
             if (queue->multiFecLastBlockNumber != 0) {
                 Limelog("Unrecoverable frame %d (block %d of %d): %d+%d=%d received < %d needed\n",
@@ -728,8 +731,11 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         connectionSawFrame(queue->currentFrameNumber);
 
         queue->bufferFirstRecvTimeUs = PltGetMicroseconds();
+        multilinkBlockEnd(queue);
         memset(queue->primarySeen, 0, sizeof(queue->primarySeen));
         queue->primarySeenCount = 0;
+        queue->multilinkBlockOpen = true;
+        queue->multilinkBlockCompleted = false;
         queue->bufferLowestSequenceNumber = U16(packet->sequenceNumber - fecIndex);
         queue->nextContiguousSequenceNumber = queue->bufferLowestSequenceNumber;
         queue->receivedDataPackets = 0;
@@ -812,7 +818,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         // Try to submit this frame. If we haven't received enough packets,
         // this will fail and we'll keep waiting.
         if (reconstructFrame(queue) == 0) {
-            multilinkBlockEnd(queue, true);
+            queue->multilinkBlockCompleted = true;
 
             // Stage the complete FEC block for use once reassembly is complete
             stageCompleteFecBlock(queue);
@@ -844,6 +850,12 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         }
 
         return RTPF_RET_QUEUED;
+    }
+}
+
+void RtpvMultilinkFlush(PRTP_VIDEO_QUEUE queue) {
+    if (queue->multilinkBlockCompleted) {
+        multilinkBlockEnd(queue);
     }
 }
 

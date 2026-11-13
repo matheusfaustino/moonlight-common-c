@@ -62,6 +62,17 @@ int main(void) {
     CHECK(q.blocksPrimaryAloneUnrecoverable == 2);
     CHECK(delivered == 3 * DATA);
 
+    // Frame 5: secondary wins the last shard, then the primary copy arrives late: not a rescue
+    feed(5, 0, 0); feed(5, 1, 0); feed(5, 2, 0); feed(5, 3, 1);
+    CHECK(feed(5, 3, 0) == RTPF_RET_REJECTED);
+    RtpvMultilinkFlush(&q);
+    CHECK(q.blocksPrimaryAloneUnrecoverable == 2 && q.blocksRescuedBySecondary == 1 && q.blocksFailedMerged == 1);
+
+    // Frame 6: the primary never delivers shard 3, so flush counts a rescue
+    feed(6, 0, 0); feed(6, 1, 0); feed(6, 2, 0); feed(6, 3, 1);
+    RtpvMultilinkFlush(&q);
+    CHECK(q.blocksPrimaryAloneUnrecoverable == 3 && q.blocksRescuedBySecondary == 2 && q.blocksFailedMerged == 1);
+
     RtpvCleanupQueue(&q);
     printf("ok\n");
     return 0;
