@@ -303,6 +303,10 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
         snprintf(payloadStr, sizeof(payloadStr), "%" PRIu32, EncryptionFeaturesEnabled);
         err |= addAttributeString(&optionHead, "x-ss-general.encryptionEnabled", payloadStr);
 
+        if (MultilinkSecondary[0] != 0 && MultilinkHostSupported && (EncryptionFeaturesEnabled & SS_ENC_VIDEO)) {
+            err |= addAttributeString(&optionHead, "x-mp-general.request", "1");
+        }
+
         // Enable YUV444 if requested
         if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_YUV444) {
             err |= addAttributeString(&optionHead, "x-ss-video[0].chromaSamplingType", "1");

@@ -1147,6 +1147,13 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             SunshineFeatureFlags = 0;
         }
 
+        // Look for the multilink capability advertised by the host
+        uint32_t mpVersion;
+        MultilinkHostSupported = parseSdpAttributeToUInt(response.payload, "x-mp-general.version", &mpVersion) && mpVersion >= 1;
+        if (MultilinkSecondary[0] != 0 && !MultilinkHostSupported) {
+            Limelog("multilink: host does not support it\n");
+        }
+
         // Look for the Sunshine encryption flags in the SDP attributes
         if (!parseSdpAttributeToUInt(response.payload, "x-ss-general.encryptionSupported", &EncryptionFeaturesSupported)) {
             EncryptionFeaturesSupported = 0;

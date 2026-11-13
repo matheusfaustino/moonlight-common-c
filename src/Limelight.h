@@ -911,6 +911,13 @@ typedef struct _RTP_VIDEO_STATS {
 
 void LiGetRTPVideoStats(PRTP_VIDEO_STATS stats);
 
+// Opt in to receiving video over a second local interface (IPv4 address or, on
+// Linux, an interface name) in addition to the normal path. NULL disables it. Must
+// be called before LiStartConnection(). It only takes effect if the host advertises
+// multilink support and video encryption is enabled; otherwise the stream is
+// identical to a normal single-path stream.
+void LiSetMultilinkSecondary(const char* ipv4OrIfname);
+
 // Port index flags for use with LiGetPortFromPortFlagIndex() and LiGetProtocolFromPortFlagIndex()
 #define ML_PORT_INDEX_TCP_47984 0
 #define ML_PORT_INDEX_TCP_47989 1

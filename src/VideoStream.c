@@ -1,5 +1,10 @@
 #include "Limelight-internal.h"
 
+#if defined(__linux__)
+#include <ifaddrs.h>
+#include <net/if.h>
+#endif
+
 #define FIRST_FRAME_MAX 1500
 #define FIRST_FRAME_TIMEOUT_SEC 10
 
@@ -11,6 +16,19 @@ static SOCKET rtpSocket = INVALID_SOCKET;
 static SOCKET firstFrameSocket = INVALID_SOCKET;
 
 static PPLT_CRYPTO_CONTEXT decryptionCtx;
+
+// Multilink: optional second UDP socket bound to another local interface.
+// Both sockets feed rtpQueue from the single receive thread.
+char MultilinkSecondary[64];
+bool MultilinkHostSupported;
+static SOCKET secondarySocket = INVALID_SOCKET;
+static atomic_bool secondaryFailed;
+
+typedef struct {
+    uint64_t packets, bytes, decryptFailures, accepted, rejected;
+} PATH_STATS;
+static PATH_STATS pathStats[2];
+static uint64_t lastSummaryMs;
 
 static PLT_THREAD udpPingThread;
 static PLT_THREAD receiveThread;
@@ -34,6 +52,105 @@ static bool receivedFullFrame;
 // and subsequent packet/frame bursts that follow.
 #define RTP_RECV_PACKETS_BUFFERED 2048
 
+void LiSetMultilinkSecondary(const char* ipv4OrIfname) {
+    if (ipv4OrIfname != NULL) {
+        snprintf(MultilinkSecondary, sizeof(MultilinkSecondary), "%s", ipv4OrIfname);
+    }
+    else {
+        MultilinkSecondary[0] = 0;
+    }
+}
+
+// Binds secondarySocket to the given IPv4 address or interface name. Failure
+// leaves the stream single-path.
+static void openSecondarySocket(void) {
+    struct sockaddr_storage bindAddr;
+    struct sockaddr_in* in4 = (struct sockaddr_in*)&bindAddr;
+    const char* ifname = NULL;
+
+    secondarySocket = INVALID_SOCKET;
+    if (MultilinkSecondary[0] == 0 || !MultilinkHostSupported) {
+        return;
+    }
+    if (!(EncryptionFeaturesEnabled & SS_ENC_VIDEO) || RemoteAddr.ss_family != AF_INET) {
+        Limelog("multilink: disabled (needs IPv4 and encrypted video)\n");
+        return;
+    }
+
+    memset(&bindAddr, 0, sizeof(bindAddr));
+    in4->sin_family = AF_INET;
+    if (inet_pton(AF_INET, MultilinkSecondary, &in4->sin_addr) != 1) {
+        ifname = MultilinkSecondary;
+#if defined(__linux__)
+        struct ifaddrs* ifas;
+        bool found = false;
+        if (getifaddrs(&ifas) == 0) {
+            for (struct ifaddrs* ifa = ifas; ifa != NULL; ifa = ifa->ifa_next) {
+                if (ifa->ifa_addr != NULL && ifa->ifa_addr->sa_family == AF_INET &&
+                        strcmp(ifa->ifa_name, ifname) == 0) {
+                    in4->sin_addr = ((struct sockaddr_in*)ifa->ifa_addr)->sin_addr;
+                    found = true;
+                    break;
+                }
+            }
+            freeifaddrs(ifas);
+        }
+        if (!found) {
+            Limelog("multilink: no IPv4 address on interface %s, disabled\n", ifname);
+            return;
+        }
+#else
+        Limelog("multilink: interface names unsupported here, pass an IPv4 address\n");
+        return;
+#endif
+    }
+
+    secondarySocket = bindUdpSocket(AF_INET, &bindAddr, sizeof(struct sockaddr_in),
+                                    RTP_RECV_PACKETS_BUFFERED * (StreamConfig.packetSize + MAX_RTP_HEADER_SIZE),
+                                    SOCK_QOS_TYPE_VIDEO);
+    if (secondarySocket == INVALID_SOCKET) {
+        Limelog("multilink: secondary bind failed (%d), single-path\n", (int)LastSocketError());
+        return;
+    }
+
+#if defined(__linux__)
+    if (ifname != NULL && setsockopt(secondarySocket, SOL_SOCKET, SO_BINDTODEVICE, ifname, (socklen_t)strlen(ifname)) != 0) {
+        Limelog("multilink: SO_BINDTODEVICE %s failed (%d), using IP bind only\n", ifname, errno);
+    }
+#endif
+
+    char addrStr[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &in4->sin_addr, addrStr, sizeof(addrStr));
+    Limelog("multilink: secondary video socket bound to %s (%s)\n", addrStr, MultilinkSecondary);
+}
+
+static void closeVideoSockets(void) {
+    if (secondarySocket != INVALID_SOCKET) {
+        closeSocket(secondarySocket);
+        secondarySocket = INVALID_SOCKET;
+    }
+    closeSocket(rtpSocket);
+}
+
+static void logMultilinkSummary(const char* tag) {
+    RTP_VIDEO_STATS stats;
+    RtpvGetStats(&rtpQueue, &stats);
+    Limelog("multilink %s: p0 pkts=%llu bytes=%llu decfail=%llu first=%llu dup_late=%llu | "
+            "p1 pkts=%llu bytes=%llu decfail=%llu first=%llu dup_late=%llu | "
+            "blocks_primary_alone_unrecoverable=%u blocks_rescued_by_secondary=%u blocks_failed_merged=%u | "
+            "fec_recovered=%u fec_failed=%u oos=%u%s\n",
+            tag,
+            (unsigned long long)pathStats[0].packets, (unsigned long long)pathStats[0].bytes,
+            (unsigned long long)pathStats[0].decryptFailures, (unsigned long long)pathStats[0].accepted,
+            (unsigned long long)pathStats[0].rejected,
+            (unsigned long long)pathStats[1].packets, (unsigned long long)pathStats[1].bytes,
+            (unsigned long long)pathStats[1].decryptFailures, (unsigned long long)pathStats[1].accepted,
+            (unsigned long long)pathStats[1].rejected,
+            rtpQueue.blocksPrimaryAloneUnrecoverable, rtpQueue.blocksRescuedBySecondary,
+            rtpQueue.blocksFailedMerged, stats.packetCountFecRecovered, stats.packetCountFecFailed,
+            stats.packetCountOOS, atomic_load(&secondaryFailed) ? " secondary=failed" : "");
+}
+
 // Initialize the video stream
 void initializeVideoStream(void) {
     initializeVideoDepacketizer(StreamConfig.packetSize);
@@ -42,6 +159,8 @@ void initializeVideoStream(void) {
     atomic_store_explicit(&receivedDataFromPeer, false, memory_order_relaxed);
     firstDataTimeMs = 0;
     receivedFullFrame = false;
+    memset(pathStats, 0, sizeof(pathStats));
+    atomic_store(&secondaryFailed, false);
 }
 
 // Clean up the video stream
@@ -77,6 +196,14 @@ static void VideoPingThreadProc(void* context) {
             sendto(rtpSocket, legacyPingData, sizeof(legacyPingData), 0, (struct sockaddr*)&saddr, AddrLen);
         }
 
+        if (secondarySocket != INVALID_SOCKET && !atomic_load(&secondaryFailed)) {
+            // Wire format shared with the host: "MLMP", version 1, session ping payload, path id 1
+            char mlmp[4 + 1 + sizeof(VideoPingPayload.payload) + 1] = { 'M', 'L', 'M', 'P', 1 };
+            memcpy(&mlmp[5], VideoPingPayload.payload, sizeof(VideoPingPayload.payload));
+            mlmp[sizeof(mlmp) - 1] = 1;
+            sendto(secondarySocket, mlmp, sizeof(mlmp), 0, (struct sockaddr*)&saddr, AddrLen);
+        }
+
         PltSleepMsInterruptible(&udpPingThread, 500);
     }
 }
@@ -91,6 +218,9 @@ static void VideoReceiveThreadProc(void* context) {
     bool useSelect;
     int waitingForVideoMs;
     bool encrypted;
+    int path;
+    SOCKET recvSocket;
+    bool preferSecondary = false;
 
     encrypted = !!(EncryptionFeaturesEnabled & SS_ENC_VIDEO);
     decryptedSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
@@ -108,6 +238,10 @@ static void VideoReceiveThreadProc(void* context) {
         useSelect = false;
     }
 
+    if (secondarySocket != INVALID_SOCKET && setNonFatalRecvTimeoutMs(secondarySocket, UDP_RECV_POLL_TIMEOUT_MS) < 0) {
+        useSelect = true;
+    }
+
     // Allocate a staging buffer to use for each received packet
     if (encrypted) {
         encryptedBuffer = (char*)malloc(receiveSize);
@@ -122,8 +256,14 @@ static void VideoReceiveThreadProc(void* context) {
     }
 
     waitingForVideoMs = 0;
+    lastSummaryMs = PltGetMillis();
     while (!PltIsThreadInterrupted(&receiveThread)) {
         PRTP_PACKET packet;
+
+        if (secondarySocket != INVALID_SOCKET && PltGetMillis() - lastSummaryMs >= 10000) {
+            lastSummaryMs = PltGetMillis();
+            logMultilinkSummary("summary");
+        }
 
         if (buffer == NULL) {
             buffer = (char*)malloc(bufferSize);
@@ -134,13 +274,34 @@ static void VideoReceiveThreadProc(void* context) {
             }
         }
 
-        err = recvUdpSocket(rtpSocket,
+        path = 0;
+        recvSocket = rtpSocket;
+        if (secondarySocket != INVALID_SOCKET && !atomic_load(&secondaryFailed)) {
+            // Alternate which socket wins when both are readable so a busy primary can't starve the secondary
+            struct pollfd pfds[2] = { { rtpSocket, POLLIN, 0 }, { secondarySocket, POLLIN, 0 } };
+            preferSecondary = !preferSecondary;
+            if (pollSockets(pfds, 2, UDP_RECV_POLL_TIMEOUT_MS) <= 0) {
+                recvSocket = INVALID_SOCKET;
+            }
+            else if (pfds[1].revents && (preferSecondary || !pfds[0].revents)) {
+                path = 1;
+                recvSocket = secondarySocket;
+            }
+        }
+
+        err = recvSocket == INVALID_SOCKET ? 0 :
+              recvUdpSocket(recvSocket,
                             encrypted ? encryptedBuffer : buffer,
                             receiveSize,
                             useSelect,
                             NULL,
                             NULL);
-        if (err < 0) {
+        if (err < 0 && path == 1) {
+            Limelog("multilink: secondary recv failed (%d), continuing on primary\n", (int)LastSocketError());
+            atomic_store(&secondaryFailed, true);
+            continue;
+        }
+        else if (err < 0) {
             Limelog("Video Receive: recvUdpSocket() failed: %d\n", (int)LastSocketError());
             ListenerCallbacks.connectionTerminated(LastSocketFail());
             break;
@@ -182,6 +343,9 @@ static void VideoReceiveThreadProc(void* context) {
             continue;
         }
 
+        pathStats[path].packets++;
+        pathStats[path].bytes += err;
+
         // Decrypt the packet into the buffer if encryption is enabled
         if (encrypted) {
             PENC_VIDEO_HEADER encHeader = (PENC_VIDEO_HEADER)encryptedBuffer;
@@ -208,6 +372,7 @@ static void VideoReceiveThreadProc(void* context) {
             // traffic away (as mentioned in the paragraph above) and continue accepting
             // legitmate video traffic.
             if (encHeader->frameNumber && LE32(encHeader->frameNumber) < RtpvGetCurrentFrameNumber(&rtpQueue)) {
+                pathStats[path].rejected++;
                 continue;
             }
 
@@ -219,6 +384,7 @@ static void VideoReceiveThreadProc(void* context) {
                                    ((unsigned char*)(encHeader + 1)), err - sizeof(ENC_VIDEO_HEADER), // The ciphertext is after the header
                                    (unsigned char*)buffer, &err)) {
                 Limelog("Failed to decrypt video packet!\n");
+                pathStats[path].decryptFailures++;
                 continue;
             }
         }
@@ -229,11 +395,15 @@ static void VideoReceiveThreadProc(void* context) {
         packet->timestamp = BE32(packet->timestamp);
         packet->ssrc = BE32(packet->ssrc);
 
-        queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize]);
+        queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize], path);
 
         if (queueStatus == RTPF_RET_QUEUED) {
             // The queue owns the buffer
             buffer = NULL;
+            pathStats[path].accepted++;
+        }
+        else {
+            pathStats[path].rejected++;
         }
     }
 
@@ -307,6 +477,11 @@ void stopVideoStream(void) {
         closeSocket(firstFrameSocket);
         firstFrameSocket = INVALID_SOCKET;
     }
+    if (secondarySocket != INVALID_SOCKET) {
+        logMultilinkSummary("final");
+        closeSocket(secondarySocket);
+        secondarySocket = INVALID_SOCKET;
+    }
     if (rtpSocket != INVALID_SOCKET) {
         closeSocket(rtpSocket);
         rtpSocket = INVALID_SOCKET;
@@ -338,12 +513,14 @@ int startVideoStream(void* rendererContext, int drFlags) {
         return LastSocketError();
     }
 
+    openSecondarySocket();
+
     VideoCallbacks.start();
 
     err = PltCreateThread("VideoRecv", VideoReceiveThreadProc, NULL, &receiveThread);
     if (err != 0) {
         VideoCallbacks.stop();
-        closeSocket(rtpSocket);
+        closeVideoSockets();
         VideoCallbacks.cleanup();
         return err;
     }
@@ -354,7 +531,7 @@ int startVideoStream(void* rendererContext, int drFlags) {
             VideoCallbacks.stop();
             PltInterruptThread(&receiveThread);
             PltJoinThread(&receiveThread);
-            closeSocket(rtpSocket);
+            closeVideoSockets();
             VideoCallbacks.cleanup();
             return err;
         }
@@ -375,7 +552,7 @@ int startVideoStream(void* rendererContext, int drFlags) {
             if ((VideoCallbacks.capabilities & (CAPABILITY_DIRECT_SUBMIT | CAPABILITY_PULL_RENDERER)) == 0) {
                 PltJoinThread(&decoderThread);
             }
-            closeSocket(rtpSocket);
+            closeVideoSockets();
             VideoCallbacks.cleanup();
             return LastSocketError();
         }
@@ -395,7 +572,7 @@ int startVideoStream(void* rendererContext, int drFlags) {
         if ((VideoCallbacks.capabilities & (CAPABILITY_DIRECT_SUBMIT | CAPABILITY_PULL_RENDERER)) == 0) {
             PltJoinThread(&decoderThread);
         }
-        closeSocket(rtpSocket);
+        closeVideoSockets();
         if (firstFrameSocket != INVALID_SOCKET) {
             closeSocket(firstFrameSocket);
             firstFrameSocket = INVALID_SOCKET;
