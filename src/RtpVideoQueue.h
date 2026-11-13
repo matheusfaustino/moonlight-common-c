@@ -59,6 +59,15 @@ typedef struct _RTP_VIDEO_QUEUE {
     uint64_t lastOosFramePresentationTimestamp;
     bool receivedOosData;
 
+    // Multilink counterfactual: which shards of the current FEC block the primary
+    // path delivered (even if the secondary copy won the race), plus lifetime
+    // per-block counters. Only touched from the receive thread.
+    uint8_t primarySeen[32];
+    uint32_t primarySeenCount;
+    uint32_t blocksPrimaryAloneUnrecoverable;
+    uint32_t blocksRescuedBySecondary;
+    uint32_t blocksFailedMerged;
+
     RTP_VIDEO_QUEUE_STATS stats; // the above values are short-lived, this tracks stats for the life of the queue
 } RTP_VIDEO_QUEUE, *PRTP_VIDEO_QUEUE;
 
@@ -67,7 +76,8 @@ typedef struct _RTP_VIDEO_QUEUE {
 
 void RtpvInitializeQueue(PRTP_VIDEO_QUEUE queue);
 void RtpvCleanupQueue(PRTP_VIDEO_QUEUE queue);
-int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry);
+// path: 0 = primary socket, 1 = multilink secondary
+int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry, int path);
 uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue);
 void RtpvSubmitQueuedPackets(PRTP_VIDEO_QUEUE queue);
 void RtpvGetStats(PRTP_VIDEO_QUEUE queue, PRTP_VIDEO_STATS stats);

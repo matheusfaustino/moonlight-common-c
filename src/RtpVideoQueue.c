@@ -108,6 +108,30 @@ static void reportFinalFrameFecStatus(PRTP_VIDEO_QUEUE queue) {
     connectionSendFrameFecStatus(&fecStatus);
 }
 
+// Called once per FEC block when it completes or is abandoned. A block the primary
+// path alone could not have completed counts as rescued if the merged queue
+// completed it, otherwise as failed.
+static void multilinkBlockEnd(PRTP_VIDEO_QUEUE queue, bool completed) {
+    if (queue->primarySeenCount >= queue->bufferDataPackets) {
+        return;
+    }
+    queue->blocksPrimaryAloneUnrecoverable++;
+    if (completed) {
+        queue->blocksRescuedBySecondary++;
+    }
+    else {
+        queue->blocksFailedMerged++;
+    }
+}
+
+static void markPrimaryShard(PRTP_VIDEO_QUEUE queue, uint16_t sequenceNumber) {
+    uint16_t shard = U16(sequenceNumber - queue->bufferLowestSequenceNumber);
+    if (shard < sizeof(queue->primarySeen) * 8 && !(queue->primarySeen[shard / 8] & (1 << (shard % 8)))) {
+        queue->primarySeen[shard / 8] |= 1 << (shard % 8);
+        queue->primarySeenCount++;
+    }
+}
+
 // newEntry is contained within the packet buffer so we free the whole entry by freeing entry->packet
 static bool queuePacket(PRTP_VIDEO_QUEUE queue, PRTPV_QUEUE_ENTRY newEntry, PRTP_PACKET packet, int length, bool isParity, bool isFecRecovery) {
     PRTPV_QUEUE_ENTRY entry;
@@ -541,9 +565,14 @@ uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue) {
     return queue->currentFrameNumber;
 }
 
-int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry) {
+int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry, int path) {
     if (isBefore16(packet->sequenceNumber, queue->nextContiguousSequenceNumber)) {
-        // Reject packets behind our current buffer window
+        // Reject packets behind our current buffer window. A primary copy of a shard the
+        // secondary already delivered lands here and still counts for the counterfactual.
+        if (path == 0 && queue->pendingFecBlockList.count != 0 &&
+                !isBefore16(packet->sequenceNumber, queue->bufferLowestSequenceNumber)) {
+            markPrimaryShard(queue, packet->sequenceNumber);
+        }
         return RTPF_RET_REJECTED;
     }
 
@@ -596,6 +625,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         if (queue->pendingFecBlockList.count != 0) {
             // Report the final status of the FEC queue before dropping this frame
             reportFinalFrameFecStatus(queue);
+            multilinkBlockEnd(queue, false);
 
             if (queue->multiFecLastBlockNumber != 0) {
                 Limelog("Unrecoverable frame %d (block %d of %d): %d+%d=%d received < %d needed\n",
@@ -698,6 +728,8 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         connectionSawFrame(queue->currentFrameNumber);
 
         queue->bufferFirstRecvTimeUs = PltGetMicroseconds();
+        memset(queue->primarySeen, 0, sizeof(queue->primarySeen));
+        queue->primarySeenCount = 0;
         queue->bufferLowestSequenceNumber = U16(packet->sequenceNumber - fecIndex);
         queue->nextContiguousSequenceNumber = queue->bufferLowestSequenceNumber;
         queue->receivedDataPackets = 0;
@@ -721,6 +753,10 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
     // Reject packets above our FEC queue valid sequence number range
     if (isBefore16(queue->bufferHighestSequenceNumber, packet->sequenceNumber)) {
         return RTPF_RET_REJECTED;
+    }
+
+    if (path == 0) {
+        markPrimaryShard(queue, packet->sequenceNumber);
     }
 
     LC_ASSERT_VT(!queue->fecPercentage || U16(packet->sequenceNumber - fecIndex) == queue->bufferLowestSequenceNumber);
@@ -776,6 +812,8 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         // Try to submit this frame. If we haven't received enough packets,
         // this will fail and we'll keep waiting.
         if (reconstructFrame(queue) == 0) {
+            multilinkBlockEnd(queue, true);
+
             // Stage the complete FEC block for use once reassembly is complete
             stageCompleteFecBlock(queue);
 
