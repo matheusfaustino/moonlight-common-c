@@ -30,7 +30,7 @@ typedef struct {
 static PATH_STATS pathStats[2];
 static uint64_t lastSummaryMs;
 
-// Secondary liveness, judged from authenticated packets on the receive thread
+// Secondary liveness from received datagrams (before decrypt), on the receive thread
 #define ML_SILENCE_MS 2000
 static bool secondarySeen, secondarySilent;
 static uint64_t lastPrimaryMs, lastSecondaryMs;
@@ -156,6 +156,7 @@ static const char* secondaryState(void) {
     return secondarySeen && lastPrimaryMs < lastSecondaryMs + ML_SILENCE_MS ? "active" : "absent";
 }
 
+// Held packets count as accepted on arrival; the queue reports those it rejected on replay.
 static void logMultilinkSummary(const char* tag) {
     RTP_VIDEO_STATS stats;
     RtpvGetStats(&rtpQueue, &stats);
@@ -167,11 +168,13 @@ static void logMultilinkSummary(const char* tag) {
             "secondary=%s secondary_silences=%u mlmp_sent=%u mlmp_errors=%u\n",
             tag,
             (unsigned long long)pathStats[0].packets, (unsigned long long)pathStats[0].bytes,
-            (unsigned long long)pathStats[0].decryptFailures, (unsigned long long)pathStats[0].accepted,
-            (unsigned long long)pathStats[0].rejected,
+            (unsigned long long)pathStats[0].decryptFailures,
+            (unsigned long long)(pathStats[0].accepted - rtpQueue.mlReplayRejected[0]),
+            (unsigned long long)(pathStats[0].rejected + rtpQueue.mlReplayRejected[0]),
             (unsigned long long)pathStats[1].packets, (unsigned long long)pathStats[1].bytes,
-            (unsigned long long)pathStats[1].decryptFailures, (unsigned long long)pathStats[1].accepted,
-            (unsigned long long)pathStats[1].rejected,
+            (unsigned long long)pathStats[1].decryptFailures,
+            (unsigned long long)(pathStats[1].accepted - rtpQueue.mlReplayRejected[1]),
+            (unsigned long long)(pathStats[1].rejected + rtpQueue.mlReplayRejected[1]),
             rtpQueue.blocksPrimaryAloneUnrecoverable, rtpQueue.blocksRescuedBySecondary,
             rtpQueue.blocksFailedMerged, rtpQueue.blocksUnfinalized,
             rtpQueue.graceHeldPackets, rtpQueue.graceSavedBlocks, rtpQueue.graceGaveUpBlocks,
@@ -428,6 +431,8 @@ static void VideoReceiveThreadProc(void* context) {
                 if (!secondarySilent && !atomic_load(&secondaryFailed) && now - lastSecondaryMs >= ML_SILENCE_MS) {
                     secondarySilent = true;
                     secondarySilences++;
+                    // Stop waiting for a silent secondary; its next packet restarts tracking
+                    rtpQueue.mlHaveSecondary = false;
                     Limelog("multilink: no secondary video for %d ms while primary receives (%u times)\n",
                             ML_SILENCE_MS, secondarySilences);
                 }

@@ -164,7 +164,11 @@ static void mlMarkPrimary(PRTP_VIDEO_QUEUE queue, uint16_t sequenceNumber) {
 static void mlStartBlock(PRTP_VIDEO_QUEUE queue) {
     ML_BLOCK* cur = &queue->mlRing[(queue->mlNext + ML_RING_BLOCKS - 1) % ML_RING_BLOCKS];
     cur->resolved = true;
-    mlFinalizeReady(queue);
+    // While replaying held packets, primary copies later in the held list are not marked
+    // yet; mlRelease finalizes after the replay instead.
+    if (!queue->mlDraining) {
+        mlFinalizeReady(queue);
+    }
 
     ML_BLOCK* b = &queue->mlRing[queue->mlNext++ % ML_RING_BLOCKS];
     mlFinalize(queue, b, true);
@@ -419,8 +423,10 @@ static int reconstructFrame(PRTP_VIDEO_QUEUE queue) {
 
         // Report the final FEC status if we needed to perform a recovery
         reportFinalFrameFecStatus(queue);
-        atomic_fetch_add_explicit(&queue->stats.packetCountFecRecovered,
-                                  queue->bufferDataPackets - queue->receivedDataPackets, memory_order_relaxed);
+        if (ret == 0) {
+            atomic_fetch_add_explicit(&queue->stats.packetCountFecRecovered,
+                                      queue->bufferDataPackets - queue->receivedDataPackets, memory_order_relaxed);
+        }
     }
 
 cleanup_packets:
@@ -623,7 +629,7 @@ static bool mlGiveUp(PRTP_VIDEO_QUEUE queue, uint64_t nowUs) {
     uint16_t last = (uint16_t)queue->bufferHighestSequenceNumber;
     return queue->mlHeld.count >= ML_HOLD_MAX || nowUs - queue->mlHoldStartUs >= ML_GRACE_US ||
            (queue->mlHavePrimary && isBefore16(last, queue->mlPrimaryHigh) &&
-            queue->mlHaveSecondary && isBefore16(last, queue->mlSecondaryHigh));
+            queue->mlHaveSecondary && isBefore16(U16(last + ML_REORDER_SLACK), queue->mlSecondaryHigh));
 }
 
 // Called where a packet would start a new FEC block. Holds it if the current block is
@@ -643,7 +649,6 @@ static bool mlHold(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV
     entry->path = (uint8_t)path;
     entry->prev = entry->next = NULL;
     insertEntryIntoList(&queue->mlHeld, entry);
-    queue->graceHeldPackets++;
     return true;
 }
 
@@ -671,6 +676,7 @@ static void mlRelease(PRTP_VIDEO_QUEUE queue) {
 
         RTPV_QUEUE_LIST held = queue->mlHeld;
         memset(&queue->mlHeld, 0, sizeof(queue->mlHeld));
+        queue->mlDraining = true;
         while (held.head != NULL) {
             PRTPV_QUEUE_ENTRY e = held.head;
             uint16_t seq = e->packet->sequenceNumber;
@@ -678,6 +684,7 @@ static void mlRelease(PRTP_VIDEO_QUEUE queue) {
             removeEntryFromList(&held, e);
             if (addPacket(queue, e->packet, e->length, e, path, mode) != RTPF_RET_QUEUED) {
                 free(e->packet);
+                queue->mlReplayRejected[path]++;
             }
             mode = ML_REPLAY;
             // At arrival its block was not tracked yet
@@ -685,6 +692,8 @@ static void mlRelease(PRTP_VIDEO_QUEUE queue) {
                 mlMarkPrimary(queue, seq);
             }
         }
+        queue->mlDraining = false;
+        mlFinalizeReady(queue);
     }
 }
 
@@ -765,6 +774,9 @@ static int addPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRT
     if (queue->pendingFecBlockList.count == 0 || queue->currentFrameNumber != nvPacket->frameIndex ||
             queue->multiFecCurrentBlockNumber != fecCurrentBlockNumber) {
         if (mlHold(queue, packet, length, packetEntry, path, replay != ML_REPLAY_ABANDON)) {
+            if (replay == ML_LIVE) {
+                queue->graceHeldPackets++;
+            }
             return RTPF_RET_QUEUED;
         }
 

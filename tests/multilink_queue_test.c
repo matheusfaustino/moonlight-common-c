@@ -143,14 +143,18 @@ int main(void) {
     CHECK(q.graceHeldPackets == 1 && q.graceSavedBlocks == 1 && q.graceGaveUpBlocks == 0);
     CHECK(q.stats.packetCountFecFailed == 0 && q.currentFrameNumber == 2);
 
-    // Seq 14 lost on both paths: given up as soon as both paths are past it, not after the grace.
+    // Seq 14 lost on both paths: given up once both paths are past it (the secondary by
+    // more than ML_REORDER_SLACK), not after the grace.
     feedb(12, 3, 0, 0, 0, 0); feedb(13, 3, 0, 0, 1, 0); feedb(15, 3, 0, 0, 3, 0);
     feedb(12, 3, 0, 0, 0, 1); feedb(13, 3, 0, 0, 1, 1); feedb(15, 3, 0, 0, 3, 1);
     feedb(16, 4, 0, 0, 0, 0);
     CHECK(q.mlHeld.count == 1 && q.currentFrameNumber == 3);
     feedb(16, 4, 0, 0, 0, 1);
+    CHECK(q.mlHeld.count == 2 && q.graceGaveUpBlocks == 0);            // within the slack
+    q.mlSecondaryHigh = 15 + ML_REORDER_SLACK + 1;                      // secondary delivered further on
+    feedb(17, 4, 0, 0, 1, 1);
     CHECK(q.mlHeld.count == 0 && q.graceGaveUpBlocks == 1 && q.stats.packetCountFecFailed == 1);
-    CHECK(q.currentFrameNumber == 4 && q.pendingFecBlockList.count == 1);
+    CHECK(q.currentFrameNumber == 4 && q.pendingFecBlockList.count == 2);
     for (int i = 1; i < DATA; i++) feedb((uint16_t)(16 + i), 4, 0, 0, i, 0);
 
     // Grace expiry: the secondary never passes frame 5, so it is given up after ML_GRACE_US.
@@ -171,9 +175,50 @@ int main(void) {
     for (int i = 1; i < DATA; i++) feedb((uint16_t)(32 + i), 8, 0, 0, i, 0);
     CHECK(delivered - before == 2 * DATA && q.currentFrameNumber == 9 && q.graceGaveUpBlocks == 2);
 
-    // OOS and FEC-recovered stats are live
+    // OOS stats are live
     CHECK(q.stats.packetCountOOS > 0);
+    RtpvCleanupQueue(&q);
 
+    // Jittered secondary: its frame-2 shard overtakes its copy of the shard the primary
+    // lost. Being only just past the block must not give it up.
+    RtpvInitializeQueue(&q);
+    q.multilink = true;
+    delivered = 0;
+    feedb(0, 1, 0, 0, 0, 0); feedb(1, 1, 0, 0, 1, 0); feedb(3, 1, 0, 0, 3, 0);
+    feedb(0, 1, 0, 0, 0, 1); feedb(1, 1, 0, 0, 1, 1);
+    feedb(4, 2, 0, 0, 0, 0);
+    feedb(3, 1, 0, 0, 3, 1); feedb(4, 2, 0, 0, 0, 1);                  // secondary one past
+    CHECK(q.mlHeld.count == 2 && q.graceGaveUpBlocks == 0);
+    feedb(2, 1, 0, 0, 2, 1);                                           // the reordered copy
+    CHECK(q.mlHeld.count == 0 && q.graceSavedBlocks == 1 && q.currentFrameNumber == 2);
+    for (int i = 1; i < DATA; i++) feedb((uint16_t)(4 + i), 2, 0, 0, i, 0);
+    CHECK(delivered == 2 * DATA && q.stats.packetCountFecFailed == 0);
+    CHECK(q.graceHeldPackets == 2 && q.mlReplayRejected[1] == 1);      // late secondary dup of seq 4
+
+    // Silent secondary (cleared by the receive side): a primary loss is given up at once.
+    q.mlHaveSecondary = false;
+    q.mlSecondaryHigh = 40000;                                         // stale, wrapped
+    feedb(8, 3, 0, 0, 0, 0); feedb(9, 3, 0, 0, 1, 0); feedb(11, 3, 0, 0, 3, 0);
+    feedb(12, 4, 0, 0, 0, 0);
+    CHECK(q.mlHeld.count == 0 && q.stats.packetCountFecFailed == 1 && q.currentFrameNumber == 4);
+    feedb(13, 4, 0, 0, 1, 1);                                          // secondary resumes
+    CHECK(q.mlHaveSecondary && q.mlSecondaryHigh == 13);
+    RtpvCleanupQueue(&q);
+
+    // Replay counterfactual: the secondary is ahead by two frames and late primary copies of
+    // frame 2 are held behind frame 3's first shard. Frame 2 was primary-complete, so it must
+    // not be counted as primary-alone-unrecoverable.
+    RtpvInitializeQueue(&q);
+    q.multilink = true;
+    feedb(0, 1, 0, 0, 0, 0); feedb(1, 1, 0, 0, 1, 0); feedb(0, 1, 0, 0, 0, 1);
+    for (int i = 0; i < DATA; i++) feedb((uint16_t)(4 + i), 2, 0, 0, i, 1);
+    feedb(8, 3, 0, 0, 0, 1);
+    for (int i = 0; i < DATA; i++) feedb((uint16_t)(4 + i), 2, 0, 0, i, 0);
+    feedb(8, 3, 0, 0, 0, 0);
+    CHECK(q.mlHeld.count == 10);
+    feedb(2, 1, 0, 0, 2, 0); feedb(3, 1, 0, 0, 3, 0);                  // primary finishes frame 1
+    CHECK(q.mlHeld.count == 0 && q.currentFrameNumber == 3);
+    CHECK(CNT(0, 0, 0, 0));
     RtpvCleanupQueue(&q);
     printf("ok\n");
     return 0;

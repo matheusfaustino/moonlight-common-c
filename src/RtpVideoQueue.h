@@ -34,6 +34,9 @@ typedef struct _RTPV_QUEUE_LIST {
 // ML_HOLD_MAX matches the socket buffer (RTP_RECV_PACKETS_BUFFERED).
 #define ML_GRACE_US 20000
 #define ML_HOLD_MAX 2048
+// The secondary only counts as past a block this many sequence numbers beyond its last
+// shard, so slight Wi-Fi reordering does not give up a block whose copy is still coming.
+#define ML_REORDER_SLACK 8
 
 typedef struct _ML_BLOCK {
     bool used;
@@ -97,11 +100,13 @@ typedef struct _RTP_VIDEO_QUEUE {
     uint32_t blocksUnfinalized;   // primary never moved past the block within the ring window
 
     bool multilink;               // grace enabled; set by the receive side only
-    bool mlHaveSecondary;
+    bool mlHaveSecondary;         // cleared by the receive side when the secondary goes silent
     uint16_t mlSecondaryHigh;     // highest sequence number the secondary delivered
+    bool mlDraining;
+    uint32_t mlReplayRejected[2]; // held packets (counted as queued on arrival) rejected on replay, per path
     RTPV_QUEUE_LIST mlHeld;       // later-block packets held in arrival order
     uint64_t mlHoldStartUs;
-    uint32_t graceHeldPackets;    // packets that were held
+    uint32_t graceHeldPackets;    // packets held on arrival (re-holds during replay not counted)
     uint32_t graceSavedBlocks;    // blocks completed after a later-block packet was held
     uint32_t graceGaveUpBlocks;   // blocks abandoned after holding (grace, both paths past, cap)
 
