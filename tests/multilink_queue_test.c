@@ -1,5 +1,5 @@
-// Multilink counterfactual counters in RtpVideoQueue.c, driven with scripted
-// per-path delivery (FEC 0%, so a block needs all of its data shards).
+// Multilink counterfactual counters and receive grace in RtpVideoQueue.c, driven with
+// scripted per-path delivery (FEC 0%, so a block needs all of its data shards).
 //
 // Build and run from this directory:
 //   cc -std=c11 -I../src -I../nanors -I../nanors/deps/obl -I../enet/include
@@ -42,6 +42,40 @@ static int feed(uint32_t frame, uint32_t shard, int path) {
     int r = RtpvAddPacket(&q, p, len, (PRTPV_QUEUE_ENTRY)(buf + len), path);
     if (r != RTPF_RET_QUEUED) free(buf);
     return r;
+}
+
+// Shard of a frame with blocks of DATA shards each, at an explicit sequence number.
+static int feedb(uint16_t seq, uint32_t frame, int block, int lastBlock, int shard, int path) {
+    int len = sizeof(RTP_PACKET) + 4 + sizeof(NV_VIDEO_PACKET) + 16;
+    char* buf = calloc(1, len + sizeof(RTPV_QUEUE_ENTRY));
+    PRTP_PACKET p = (PRTP_PACKET)buf;
+    p->header = FLAG_EXTENSION;
+    p->sequenceNumber = seq;
+    PNV_VIDEO_PACKET nv = (PNV_VIDEO_PACKET)(buf + sizeof(RTP_PACKET) + 4);
+    nv->frameIndex = frame;
+    nv->flags = FLAG_CONTAINS_PIC_DATA | (shard == 0 && block == 0 ? FLAG_SOF : 0) |
+                (shard == DATA - 1 && block == lastBlock ? FLAG_EOF : 0);
+    nv->fecInfo = (DATA << 22) | (shard << 12);
+    nv->multiFecBlocks = (uint8_t)(((lastBlock << 2) | block) << 4);
+    int r = RtpvAddPacket(&q, p, len, (PRTPV_QUEUE_ENTRY)(buf + len), path);
+    if (r != RTPF_RET_QUEUED) free(buf);
+    return r;
+}
+
+// Frame 1 has three blocks (seqs 0-3, 4-7, 8-11), like the startup IDR. The primary
+// loses seq 6 and starts block 3 (seq 8) before the secondary's copy of seq 6 arrives.
+// Returns shards delivered.
+static int raceSecondaryLateCopy(bool multilink) {
+    RtpvInitializeQueue(&q);
+    q.multilink = multilink;
+    delivered = 0;
+    feedb(0, 1, 0, 2, 0, 1);
+    for (int i = 0; i < DATA; i++) feedb((uint16_t)i, 1, 0, 2, i, 0);
+    feedb(4, 1, 1, 2, 0, 0); feedb(5, 1, 1, 2, 1, 0); feedb(7, 1, 1, 2, 3, 0);
+    feedb(8, 1, 2, 2, 0, 0);                                           // primary starts block 3
+    for (int i = 1; i < 3 * DATA; i++) feedb((uint16_t)i, 1, i / DATA, 2, i % DATA, 1);
+    for (int i = 1; i < DATA; i++) feedb((uint16_t)(8 + i), 1, 2, 2, i, 0);
+    return delivered;
 }
 
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); return 1; } } while (0)
@@ -99,6 +133,46 @@ int main(void) {
     CHECK(CNT(3, 2, 1, 1));
     RtpvMultilinkFlush(&q);
     CHECK(CNT(3, 2, 1, 9));
+
+    RtpvCleanupQueue(&q);
+
+    // Receive grace. Without it the late copy is useless and frame 1 is lost.
+    CHECK(raceSecondaryLateCopy(false) == 0);
+    RtpvCleanupQueue(&q);
+    CHECK(raceSecondaryLateCopy(true) == 3 * DATA);
+    CHECK(q.graceHeldPackets == 1 && q.graceSavedBlocks == 1 && q.graceGaveUpBlocks == 0);
+    CHECK(q.stats.packetCountFecFailed == 0 && q.currentFrameNumber == 2);
+
+    // Seq 14 lost on both paths: given up as soon as both paths are past it, not after the grace.
+    feedb(12, 3, 0, 0, 0, 0); feedb(13, 3, 0, 0, 1, 0); feedb(15, 3, 0, 0, 3, 0);
+    feedb(12, 3, 0, 0, 0, 1); feedb(13, 3, 0, 0, 1, 1); feedb(15, 3, 0, 0, 3, 1);
+    feedb(16, 4, 0, 0, 0, 0);
+    CHECK(q.mlHeld.count == 1 && q.currentFrameNumber == 3);
+    feedb(16, 4, 0, 0, 0, 1);
+    CHECK(q.mlHeld.count == 0 && q.graceGaveUpBlocks == 1 && q.stats.packetCountFecFailed == 1);
+    CHECK(q.currentFrameNumber == 4 && q.pendingFecBlockList.count == 1);
+    for (int i = 1; i < DATA; i++) feedb((uint16_t)(16 + i), 4, 0, 0, i, 0);
+
+    // Grace expiry: the secondary never passes frame 5, so it is given up after ML_GRACE_US.
+    feedb(20, 5, 0, 0, 0, 0); feedb(21, 5, 0, 0, 1, 0); feedb(23, 5, 0, 0, 3, 0);
+    feedb(24, 6, 0, 0, 0, 0);
+    CHECK(q.mlHeld.count == 1);
+    q.mlHoldStartUs -= ML_GRACE_US;
+    feedb(25, 6, 0, 0, 1, 0);
+    CHECK(q.mlHeld.count == 0 && q.graceGaveUpBlocks == 2 && q.currentFrameNumber == 6);
+    feedb(26, 6, 0, 0, 2, 0); feedb(27, 6, 0, 0, 3, 0);
+    CHECK(q.currentFrameNumber == 7);
+
+    // Secondary ahead (parity mode case): its frame-8 shard must not abandon frame 7.
+    int before = delivered;
+    feedb(28, 7, 0, 0, 0, 0); feedb(29, 7, 0, 0, 1, 0);
+    feedb(32, 8, 0, 0, 0, 1);
+    feedb(30, 7, 0, 0, 2, 0); feedb(31, 7, 0, 0, 3, 0);
+    for (int i = 1; i < DATA; i++) feedb((uint16_t)(32 + i), 8, 0, 0, i, 0);
+    CHECK(delivered - before == 2 * DATA && q.currentFrameNumber == 9 && q.graceGaveUpBlocks == 2);
+
+    // OOS and FEC-recovered stats are live
+    CHECK(q.stats.packetCountOOS > 0);
 
     RtpvCleanupQueue(&q);
     printf("ok\n");

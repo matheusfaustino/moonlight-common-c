@@ -39,6 +39,7 @@ static void purgeListEntries(PRTPV_QUEUE_LIST list) {
 void RtpvCleanupQueue(PRTP_VIDEO_QUEUE queue) {
     purgeListEntries(&queue->pendingFecBlockList);
     purgeListEntries(&queue->completedFecBlockList);
+    purgeListEntries(&queue->mlHeld);
 }
 
 static void insertEntryIntoList(PRTPV_QUEUE_LIST list, PRTPV_QUEUE_ENTRY entry) {
@@ -237,6 +238,7 @@ static bool queuePacket(PRTP_VIDEO_QUEUE queue, PRTPV_QUEUE_ENTRY newEntry, PRTP
             // This packet was received after a higher sequence number packet, so note that we
             // received an out of order packet to disable our speculative RFI recovery logic.
             queue->lastOosFramePresentationTimestamp = newEntry->presentationTimeUs;
+            atomic_fetch_add_explicit(&queue->stats.packetCountOOS, 1, memory_order_relaxed);
             if (!queue->receivedOosData) {
                 Limelog("Leaving speculative RFI mode after OOS video data at frame %u\n",
                         queue->currentFrameNumber);
@@ -417,6 +419,8 @@ static int reconstructFrame(PRTP_VIDEO_QUEUE queue) {
 
         // Report the final FEC status if we needed to perform a recovery
         reportFinalFrameFecStatus(queue);
+        atomic_fetch_add_explicit(&queue->stats.packetCountFecRecovered,
+                                  queue->bufferDataPackets - queue->receivedDataPackets, memory_order_relaxed);
     }
 
 cleanup_packets:
@@ -614,6 +618,76 @@ uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue) {
     return queue->currentFrameNumber;
 }
 
+// True once waiting longer for the current incomplete block is pointless or too costly.
+static bool mlGiveUp(PRTP_VIDEO_QUEUE queue, uint64_t nowUs) {
+    uint16_t last = (uint16_t)queue->bufferHighestSequenceNumber;
+    return queue->mlHeld.count >= ML_HOLD_MAX || nowUs - queue->mlHoldStartUs >= ML_GRACE_US ||
+           (queue->mlHavePrimary && isBefore16(last, queue->mlPrimaryHigh) &&
+            queue->mlHaveSecondary && isBefore16(last, queue->mlSecondaryHigh));
+}
+
+// Called where a packet would start a new FEC block. Holds it if the current block is
+// incomplete and still worth waiting for, or if earlier packets are already held (order).
+static bool mlHold(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY entry, int path, bool mayWait) {
+    if (queue->mlHeld.count == 0) {
+        if (!mayWait || !queue->multilink || !queue->mlHaveSecondary || queue->pendingFecBlockList.count == 0) {
+            return false;
+        }
+        queue->mlHoldStartUs = PltGetMicroseconds();
+        if (mlGiveUp(queue, queue->mlHoldStartUs)) {
+            return false;
+        }
+    }
+    entry->packet = packet;
+    entry->length = length;
+    entry->path = (uint8_t)path;
+    entry->prev = entry->next = NULL;
+    insertEntryIntoList(&queue->mlHeld, entry);
+    queue->graceHeldPackets++;
+    return true;
+}
+
+// addPacket replay modes: a held packet's header fields are already converted
+#define ML_LIVE 0
+#define ML_REPLAY 1
+#define ML_REPLAY_ABANDON 2   // first replay after giving up: must not wait on the block again
+
+static int addPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry, int path, int replay);
+
+// Replays held packets once the current block completed or was given up. A replayed
+// packet can be held again behind the next incomplete block.
+// ponytail: expiry is only checked when a packet arrives, so if both paths go silent the
+// held packets wait for the next packet; add a receive-loop timer if that shows up.
+static void mlRelease(PRTP_VIDEO_QUEUE queue) {
+    while (queue->mlHeld.count > 0) {
+        int mode = ML_REPLAY;
+        if (queue->pendingFecBlockList.count != 0) {
+            if (queue->multilink && !mlGiveUp(queue, PltGetMicroseconds())) {
+                return;
+            }
+            queue->graceGaveUpBlocks++;
+            mode = ML_REPLAY_ABANDON;
+        }
+
+        RTPV_QUEUE_LIST held = queue->mlHeld;
+        memset(&queue->mlHeld, 0, sizeof(queue->mlHeld));
+        while (held.head != NULL) {
+            PRTPV_QUEUE_ENTRY e = held.head;
+            uint16_t seq = e->packet->sequenceNumber;
+            int path = e->path;
+            removeEntryFromList(&held, e);
+            if (addPacket(queue, e->packet, e->length, e, path, mode) != RTPF_RET_QUEUED) {
+                free(e->packet);
+            }
+            mode = ML_REPLAY;
+            // At arrival its block was not tracked yet
+            if (path == 0) {
+                mlMarkPrimary(queue, seq);
+            }
+        }
+    }
+}
+
 int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry, int path) {
     // A primary copy counts for the counterfactual even when the secondary copy won
     // and this one is about to be rejected as a duplicate or late.
@@ -625,7 +699,19 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         }
         mlFinalizeReady(queue);
     }
+    else if (!queue->mlHaveSecondary || isBefore16(queue->mlSecondaryHigh, packet->sequenceNumber)) {
+        queue->mlSecondaryHigh = packet->sequenceNumber;
+        queue->mlHaveSecondary = true;
+    }
 
+    int ret = addPacket(queue, packet, length, packetEntry, path, ML_LIVE);
+    if (queue->mlHeld.count > 0) {
+        mlRelease(queue);
+    }
+    return ret;
+}
+
+static int addPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry, int path, int replay) {
     if (isBefore16(packet->sequenceNumber, queue->nextContiguousSequenceNumber)) {
         return RTPF_RET_REJECTED;
     }
@@ -645,9 +731,11 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
 
     PNV_VIDEO_PACKET nvPacket = (PNV_VIDEO_PACKET)(((char*)packet) + dataOffset);
 
-    nvPacket->streamPacketIndex = LE32(nvPacket->streamPacketIndex);
-    nvPacket->frameIndex = LE32(nvPacket->frameIndex);
-    nvPacket->fecInfo = LE32(nvPacket->fecInfo);
+    if (replay == ML_LIVE) {
+        nvPacket->streamPacketIndex = LE32(nvPacket->streamPacketIndex);
+        nvPacket->frameIndex = LE32(nvPacket->frameIndex);
+        nvPacket->fecInfo = LE32(nvPacket->fecInfo);
+    }
 
     // For legacy servers, we'll fixup the reserved data so that it looks like
     // it's a single FEC frame from a multi-FEC capable server. This allows us
@@ -676,7 +764,13 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
     // if we can't finish a frame before receiving the next one.
     if (queue->pendingFecBlockList.count == 0 || queue->currentFrameNumber != nvPacket->frameIndex ||
             queue->multiFecCurrentBlockNumber != fecCurrentBlockNumber) {
+        if (mlHold(queue, packet, length, packetEntry, path, replay != ML_REPLAY_ABANDON)) {
+            return RTPF_RET_QUEUED;
+        }
+
         if (queue->pendingFecBlockList.count != 0) {
+            atomic_fetch_add_explicit(&queue->stats.packetCountFecFailed, 1, memory_order_relaxed);
+
             // Report the final status of the FEC queue before dropping this frame
             reportFinalFrameFecStatus(queue);
 
@@ -866,6 +960,9 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
             ML_BLOCK* done = &queue->mlRing[(queue->mlNext + ML_RING_BLOCKS - 1) % ML_RING_BLOCKS];
             done->completed = true;
             done->resolved = true;
+            if (queue->mlHeld.count > 0) {
+                queue->graceSavedBlocks++;
+            }
 
             // Stage the complete FEC block for use once reassembly is complete
             stageCompleteFecBlock(queue);

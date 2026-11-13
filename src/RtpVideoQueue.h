@@ -13,6 +13,7 @@ typedef struct _RTPV_QUEUE_ENTRY {
     uint32_t rtpTimestamp;
     int length;
     bool isParity;
+    uint8_t path;   // multilink: path a held packet arrived on
 } RTPV_QUEUE_ENTRY, *PRTPV_QUEUE_ENTRY;
 
 typedef struct _RTPV_QUEUE_LIST {
@@ -24,6 +25,15 @@ typedef struct _RTPV_QUEUE_LIST {
 // A block is evaluated only after the primary has moved past it, or is unfinalized
 // once ML_RING_BLOCKS newer blocks have started.
 #define ML_RING_BLOCKS 8
+
+// Multilink receive grace: while the current FEC block is incomplete, packets of later
+// blocks are held instead of abandoning it, because the other path's copy of a missing
+// shard may still be in flight. The block is given up once both paths have delivered a
+// sequence number past it, ML_GRACE_US has elapsed since the first held packet, or
+// ML_HOLD_MAX packets are held. 20 ms covers the measured Wi-Fi p99 lag (16 ms);
+// ML_HOLD_MAX matches the socket buffer (RTP_RECV_PACKETS_BUFFERED).
+#define ML_GRACE_US 20000
+#define ML_HOLD_MAX 2048
 
 typedef struct _ML_BLOCK {
     bool used;
@@ -85,6 +95,15 @@ typedef struct _RTP_VIDEO_QUEUE {
     uint32_t blocksRescuedBySecondary;
     uint32_t blocksFailedMerged;
     uint32_t blocksUnfinalized;   // primary never moved past the block within the ring window
+
+    bool multilink;               // grace enabled; set by the receive side only
+    bool mlHaveSecondary;
+    uint16_t mlSecondaryHigh;     // highest sequence number the secondary delivered
+    RTPV_QUEUE_LIST mlHeld;       // later-block packets held in arrival order
+    uint64_t mlHoldStartUs;
+    uint32_t graceHeldPackets;    // packets that were held
+    uint32_t graceSavedBlocks;    // blocks completed after a later-block packet was held
+    uint32_t graceGaveUpBlocks;   // blocks abandoned after holding (grace, both paths past, cap)
 
     RTP_VIDEO_QUEUE_STATS stats; // the above values are short-lived, this tracks stats for the life of the queue
 } RTP_VIDEO_QUEUE, *PRTP_VIDEO_QUEUE;
