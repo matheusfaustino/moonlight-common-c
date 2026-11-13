@@ -30,6 +30,17 @@ typedef struct {
 static PATH_STATS pathStats[2];
 static uint64_t lastSummaryMs;
 
+// Secondary liveness, judged from authenticated packets on the receive thread
+#define ML_SILENCE_MS 2000
+static bool secondarySeen, secondarySilent;
+static uint64_t lastPrimaryMs, lastSecondaryMs;
+static uint32_t secondarySilences;
+
+// MLMP hello: written by the ping thread, read for the summary
+#define MLMP_START_BURST 5
+#define MLMP_START_BURST_INTERVAL_MS 50
+static atomic_uint mlmpSent, mlmpErrors;
+
 static PLT_THREAD udpPingThread;
 static PLT_THREAD receiveThread;
 static PLT_THREAD decoderThread;
@@ -132,13 +143,28 @@ static void closeVideoSockets(void) {
     closeSocket(rtpSocket);
 }
 
+static void disableSecondary(void) {
+    atomic_store(&secondaryFailed, true);
+    rtpQueue.multilink = false;
+}
+
+static const char* secondaryState(void) {
+    if (atomic_load(&secondaryFailed)) {
+        return "failed";
+    }
+    // Relative to the primary so the final line is not skewed by teardown time
+    return secondarySeen && lastPrimaryMs < lastSecondaryMs + ML_SILENCE_MS ? "active" : "absent";
+}
+
 static void logMultilinkSummary(const char* tag) {
     RTP_VIDEO_STATS stats;
     RtpvGetStats(&rtpQueue, &stats);
     Limelog("multilink %s: p0 pkts=%llu bytes=%llu decfail=%llu first=%llu dup_late=%llu | "
             "p1 pkts=%llu bytes=%llu decfail=%llu first=%llu dup_late=%llu | "
             "blocks_primary_alone_unrecoverable=%u blocks_rescued_by_secondary=%u blocks_failed_merged=%u blocks_unfinalized=%u | "
-            "fec_recovered=%u fec_failed=%u oos=%u%s\n",
+            "grace_held=%u grace_saved=%u grace_gave_up=%u | "
+            "fec_recovered=%u fec_failed=%u oos=%u | "
+            "secondary=%s secondary_silences=%u mlmp_sent=%u mlmp_errors=%u\n",
             tag,
             (unsigned long long)pathStats[0].packets, (unsigned long long)pathStats[0].bytes,
             (unsigned long long)pathStats[0].decryptFailures, (unsigned long long)pathStats[0].accepted,
@@ -147,8 +173,10 @@ static void logMultilinkSummary(const char* tag) {
             (unsigned long long)pathStats[1].decryptFailures, (unsigned long long)pathStats[1].accepted,
             (unsigned long long)pathStats[1].rejected,
             rtpQueue.blocksPrimaryAloneUnrecoverable, rtpQueue.blocksRescuedBySecondary,
-            rtpQueue.blocksFailedMerged, rtpQueue.blocksUnfinalized, stats.packetCountFecRecovered, stats.packetCountFecFailed,
-            stats.packetCountOOS, atomic_load(&secondaryFailed) ? " secondary=failed" : "");
+            rtpQueue.blocksFailedMerged, rtpQueue.blocksUnfinalized,
+            rtpQueue.graceHeldPackets, rtpQueue.graceSavedBlocks, rtpQueue.graceGaveUpBlocks,
+            stats.packetCountFecRecovered, stats.packetCountFecFailed, stats.packetCountOOS,
+            secondaryState(), secondarySilences, atomic_load(&mlmpSent), atomic_load(&mlmpErrors));
 }
 
 // Initialize the video stream
@@ -161,6 +189,10 @@ void initializeVideoStream(void) {
     receivedFullFrame = false;
     memset(pathStats, 0, sizeof(pathStats));
     atomic_store(&secondaryFailed, false);
+    secondarySeen = secondarySilent = false;
+    secondarySilences = 0;
+    atomic_store(&mlmpSent, 0);
+    atomic_store(&mlmpErrors, 0);
 }
 
 // Clean up the video stream
@@ -168,6 +200,22 @@ void destroyVideoStream(void) {
     PltDestroyCryptoContext(decryptionCtx);
     destroyVideoDepacketizer();
     RtpvCleanupQueue(&rtpQueue);
+}
+
+static void sendMlmpHello(LC_SOCKADDR* saddr) {
+    // Wire format shared with the host: "MLMP", version 1, session ping payload, path id 1
+    char mlmp[4 + 1 + sizeof(VideoPingPayload.payload) + 1] = { 'M', 'L', 'M', 'P', 1 };
+    memcpy(&mlmp[5], VideoPingPayload.payload, sizeof(VideoPingPayload.payload));
+    mlmp[sizeof(mlmp) - 1] = 1;
+    if (sendto(secondarySocket, mlmp, sizeof(mlmp), 0, (struct sockaddr*)saddr, AddrLen) < 0) {
+        unsigned int failures = atomic_fetch_add(&mlmpErrors, 1) + 1;
+        if ((failures & (failures - 1)) == 0) {
+            Limelog("multilink: hello send failed (%d), %u failures so far\n", (int)LastSocketError(), failures);
+        }
+    }
+    else {
+        atomic_fetch_add(&mlmpSent, 1);
+    }
 }
 
 // UDP Ping proc
@@ -185,6 +233,7 @@ static void VideoPingThreadProc(void* context) {
     // issues related to receiving ICMP port unreachable messages due
     // to sending a packet prior to the host PC binding to that port.
     int pingCount = 0;
+    bool firstPing = true;
     while (!PltIsThreadInterrupted(&udpPingThread)) {
         if (VideoPingPayload.payload[0] != 0) {
             pingCount++;
@@ -197,12 +246,15 @@ static void VideoPingThreadProc(void* context) {
         }
 
         if (secondarySocket != INVALID_SOCKET && !atomic_load(&secondaryFailed)) {
-            // Wire format shared with the host: "MLMP", version 1, session ping payload, path id 1
-            char mlmp[4 + 1 + sizeof(VideoPingPayload.payload) + 1] = { 'M', 'L', 'M', 'P', 1 };
-            memcpy(&mlmp[5], VideoPingPayload.payload, sizeof(VideoPingPayload.payload));
-            mlmp[sizeof(mlmp) - 1] = 1;
-            sendto(secondarySocket, mlmp, sizeof(mlmp), 0, (struct sockaddr*)&saddr, AddrLen);
+            // A burst at start so the host can associate the secondary before the first IDR
+            for (int i = 0; i < (firstPing ? MLMP_START_BURST : 1) && !PltIsThreadInterrupted(&udpPingThread); i++) {
+                if (i > 0) {
+                    PltSleepMsInterruptible(&udpPingThread, MLMP_START_BURST_INTERVAL_MS);
+                }
+                sendMlmpHello(&saddr);
+            }
         }
+        firstPing = false;
 
         PltSleepMsInterruptible(&udpPingThread, 500);
     }
@@ -257,6 +309,7 @@ static void VideoReceiveThreadProc(void* context) {
 
     waitingForVideoMs = 0;
     lastSummaryMs = PltGetMillis();
+    lastPrimaryMs = lastSecondaryMs = lastSummaryMs;
     while (!PltIsThreadInterrupted(&receiveThread)) {
         PRTP_PACKET packet;
 
@@ -283,7 +336,7 @@ static void VideoReceiveThreadProc(void* context) {
             int pollErr = pollSockets(pfds, 2, UDP_RECV_POLL_TIMEOUT_MS);
             if (pollErr < 0) {
                 Limelog("multilink: poll failed (%d), continuing on primary\n", (int)LastSocketError());
-                atomic_store(&secondaryFailed, true);
+                disableSecondary();
                 continue;
             }
             else if (pollErr == 0) {
@@ -304,7 +357,7 @@ static void VideoReceiveThreadProc(void* context) {
                             NULL);
         if (err < 0 && path == 1) {
             Limelog("multilink: secondary recv failed (%d), continuing on primary\n", (int)LastSocketError());
-            atomic_store(&secondaryFailed, true);
+            disableSecondary();
             continue;
         }
         else if (err < 0) {
@@ -353,6 +406,33 @@ static void VideoReceiveThreadProc(void* context) {
 
         pathStats[path].packets++;
         pathStats[path].bytes += err;
+
+        // Diagnostic only, before authentication: stale secondary copies are dropped before
+        // decrypt below, so counting after it would under-report a lagging secondary.
+        if (secondarySocket != INVALID_SOCKET) {
+            uint64_t now = PltGetMillis();
+            if (path == 1) {
+                if (!secondarySeen) {
+                    Limelog("multilink: secondary active, first video packet %llu ms after receive start\n",
+                            (unsigned long long)(now - lastSecondaryMs));
+                }
+                else if (secondarySilent) {
+                    Limelog("multilink: secondary video resumed after %llu ms\n", (unsigned long long)(now - lastSecondaryMs));
+                }
+                secondarySeen = true;
+                secondarySilent = false;
+                lastSecondaryMs = now;
+            }
+            else {
+                lastPrimaryMs = now;
+                if (!secondarySilent && !atomic_load(&secondaryFailed) && now - lastSecondaryMs >= ML_SILENCE_MS) {
+                    secondarySilent = true;
+                    secondarySilences++;
+                    Limelog("multilink: no secondary video for %d ms while primary receives (%u times)\n",
+                            ML_SILENCE_MS, secondarySilences);
+                }
+            }
+        }
 
         // Decrypt the packet into the buffer if encryption is enabled
         if (encrypted) {
@@ -530,6 +610,12 @@ int startVideoStream(void* rendererContext, int drFlags) {
     }
 
     openSecondarySocket();
+    rtpQueue.multilink = secondarySocket != INVALID_SOCKET;
+    if (MultilinkSecondary[0] != 0) {
+        Limelog("multilink: stream start, secondary socket %s (requested %s, host support %d), receive grace %d ms\n",
+                secondarySocket != INVALID_SOCKET ? "open" : "off", MultilinkSecondary, MultilinkHostSupported,
+                secondarySocket != INVALID_SOCKET ? ML_GRACE_US / 1000 : 0);
+    }
 
     VideoCallbacks.start();
 
