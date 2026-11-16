@@ -727,6 +727,10 @@ bool RtpvMultilinkSkipDuplicate(PRTP_VIDEO_QUEUE queue, uint64_t ivKey, int path
         return false;
     }
     mlObserve(queue, queue->mlSeenSeq[slot], path);
+    // This copy can be what moves both paths past a block that held packets wait on
+    if (queue->mlHeld.count > 0) {
+        mlRelease(queue);
+    }
     return true;
 }
 

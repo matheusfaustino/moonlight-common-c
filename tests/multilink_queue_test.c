@@ -241,6 +241,23 @@ int main(void) {
     for (int i = 0; i < DATA; i++) feedb((uint16_t)(DATA + i), 2, 0, 0, i, 0);
     CHECK(q.currentFrameNumber == 3 && CNT(0, 0, 0, 0));
     RtpvCleanupQueue(&q);
+
+    // Seq 2 lost on both paths. The primary's frames 2-4 are decrypted (recorded) and held;
+    // the secondary's copies of them are all skipped duplicates. The skips must still move
+    // the secondary past frame 1 and release the held frames, with no further packet.
+    RtpvInitializeQueue(&q);
+    q.multilink = true;
+    feedb(0, 1, 0, 0, 0, 0); feedb(1, 1, 0, 0, 1, 0); feedb(3, 1, 0, 0, 3, 0);
+    feedb(0, 1, 0, 0, 0, 1);
+    for (int f = 2; f <= 4; f++) for (int i = 0; i < DATA; i++) {
+        uint16_t seq = (uint16_t)((f - 1) * DATA + i);
+        feedb(seq, (uint32_t)f, 0, 0, i, 0);
+        RtpvMultilinkRecordDecrypted(&q, 1000 + seq, seq);
+    }
+    CHECK(q.mlHeld.count == 3 * DATA);
+    for (int seq = DATA; seq < 4 * DATA; seq++) CHECK(RtpvMultilinkSkipDuplicate(&q, 1000 + seq, 1));
+    CHECK(q.mlHeld.count == 0 && q.graceGaveUpBlocks == 1 && q.currentFrameNumber == 5);
+    RtpvCleanupQueue(&q);
     printf("ok\n");
     return 0;
 }

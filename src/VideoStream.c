@@ -279,6 +279,7 @@ static void VideoReceiveThreadProc(void* context) {
     SOCKET recvSocket;
     bool preferSecondary = false;
     uint64_t ivKey = 0;
+    bool ivKeyValid = false;
 
     encrypted = !!(EncryptionFeaturesEnabled & SS_ENC_VIDEO);
     decryptedSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
@@ -446,9 +447,13 @@ static void VideoReceiveThreadProc(void* context) {
         if (encrypted) {
             PENC_VIDEO_HEADER encHeader = (PENC_VIDEO_HEADER)encryptedBuffer;
 
-            // Multilink: skip decrypting the second copy of a packet. The host's IV is a
-            // per-packet counter (bytes 0-7 little-endian), so equal IVs mean the same packet.
-            if (secondarySocket != INVALID_SOCKET) {
+            // Multilink: skip decrypting the second copy of a packet. Sunshine's IV is a
+            // per-packet counter (bytes 0-7 little-endian), zeros, then 'V', so equal IVs mean
+            // the same packet. Any other IV layout is never recorded and always decrypted.
+            ivKeyValid = false;
+            if (secondarySocket != INVALID_SOCKET && encHeader->iv[8] == 0 && encHeader->iv[9] == 0 &&
+                    encHeader->iv[10] == 0 && encHeader->iv[11] == 'V') {
+                ivKeyValid = true;
                 ivKey = 0;
                 for (int i = 7; i >= 0; i--) {
                     ivKey = (ivKey << 8) | encHeader->iv[i];
@@ -512,7 +517,7 @@ static void VideoReceiveThreadProc(void* context) {
         packet->timestamp = BE32(packet->timestamp);
         packet->ssrc = BE32(packet->ssrc);
 
-        if (encrypted && secondarySocket != INVALID_SOCKET) {
+        if (encrypted && ivKeyValid) {
             RtpvMultilinkRecordDecrypted(&rtpQueue, ivKey, packet->sequenceNumber);
         }
 
