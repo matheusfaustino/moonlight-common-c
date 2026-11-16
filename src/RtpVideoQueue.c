@@ -697,21 +697,41 @@ static void mlRelease(PRTP_VIDEO_QUEUE queue) {
     }
 }
 
-int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry, int path) {
+// Per-path bookkeeping for a copy of shard seq, whether or not the queue uses it.
+static void mlObserve(PRTP_VIDEO_QUEUE queue, uint16_t seq, int path) {
     // A primary copy counts for the counterfactual even when the secondary copy won
     // and this one is about to be rejected as a duplicate or late.
     if (path == 0) {
-        mlMarkPrimary(queue, packet->sequenceNumber);
-        if (!queue->mlHavePrimary || isBefore16(queue->mlPrimaryHigh, packet->sequenceNumber)) {
-            queue->mlPrimaryHigh = packet->sequenceNumber;
+        mlMarkPrimary(queue, seq);
+        if (!queue->mlHavePrimary || isBefore16(queue->mlPrimaryHigh, seq)) {
+            queue->mlPrimaryHigh = seq;
             queue->mlHavePrimary = true;
         }
         mlFinalizeReady(queue);
     }
-    else if (!queue->mlHaveSecondary || isBefore16(queue->mlSecondaryHigh, packet->sequenceNumber)) {
-        queue->mlSecondaryHigh = packet->sequenceNumber;
+    else if (!queue->mlHaveSecondary || isBefore16(queue->mlSecondaryHigh, seq)) {
+        queue->mlSecondaryHigh = seq;
         queue->mlHaveSecondary = true;
     }
+}
+
+void RtpvMultilinkRecordDecrypted(PRTP_VIDEO_QUEUE queue, uint64_t ivKey, uint16_t seq) {
+    unsigned int slot = (unsigned int)(ivKey % ML_SEEN_SLOTS);
+    queue->mlSeenKey[slot] = ivKey + 1;
+    queue->mlSeenSeq[slot] = seq;
+}
+
+bool RtpvMultilinkSkipDuplicate(PRTP_VIDEO_QUEUE queue, uint64_t ivKey, int path) {
+    unsigned int slot = (unsigned int)(ivKey % ML_SEEN_SLOTS);
+    if (queue->mlSeenKey[slot] != ivKey + 1) {
+        return false;
+    }
+    mlObserve(queue, queue->mlSeenSeq[slot], path);
+    return true;
+}
+
+int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry, int path) {
+    mlObserve(queue, packet->sequenceNumber, path);
 
     int ret = addPacket(queue, packet, length, packetEntry, path, ML_LIVE);
     if (queue->mlHeld.count > 0) {

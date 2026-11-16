@@ -220,6 +220,27 @@ int main(void) {
     CHECK(q.mlHeld.count == 0 && q.currentFrameNumber == 3);
     CHECK(CNT(0, 0, 0, 0));
     RtpvCleanupQueue(&q);
+
+    // Pre-decrypt dedup. Only recorded (authenticated) IVs are skipped; an unseen or
+    // forged IV always goes to decrypt; a slot reused by a newer IV forgets the old one.
+    RtpvInitializeQueue(&q);
+    CHECK(!RtpvMultilinkSkipDuplicate(&q, 0, 1));                       // empty table, IV 0
+    RtpvMultilinkRecordDecrypted(&q, 7, 3);
+    CHECK(RtpvMultilinkSkipDuplicate(&q, 7, 1) && q.mlHaveSecondary && q.mlSecondaryHigh == 3);
+    CHECK(!RtpvMultilinkSkipDuplicate(&q, 8, 0) && !RtpvMultilinkSkipDuplicate(&q, 7 + ML_SEEN_SLOTS, 0));
+    RtpvMultilinkRecordDecrypted(&q, 7 + ML_SEEN_SLOTS, 9);
+    CHECK(!RtpvMultilinkSkipDuplicate(&q, 7, 0));
+    RtpvCleanupQueue(&q);
+
+    // The secondary decrypts frame 1 first; the primary's copies are skipped before decrypt
+    // but still observed, so frame 1 is primary-complete, not a rescue.
+    RtpvInitializeQueue(&q);
+    q.multilink = true;
+    for (int i = 0; i < DATA; i++) { feedb((uint16_t)i, 1, 0, 0, i, 1); RtpvMultilinkRecordDecrypted(&q, 100 + i, (uint16_t)i); }
+    for (int i = 0; i < DATA; i++) CHECK(RtpvMultilinkSkipDuplicate(&q, 100 + i, 0));
+    for (int i = 0; i < DATA; i++) feedb((uint16_t)(DATA + i), 2, 0, 0, i, 0);
+    CHECK(q.currentFrameNumber == 3 && CNT(0, 0, 0, 0));
+    RtpvCleanupQueue(&q);
     printf("ok\n");
     return 0;
 }

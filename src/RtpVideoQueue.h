@@ -38,6 +38,10 @@ typedef struct _RTPV_QUEUE_LIST {
 // shard, so slight Wi-Fi reordering does not give up a block whose copy is still coming.
 #define ML_REORDER_SLACK 8
 
+// Multilink pre-decrypt dedup: GCM IVs of recently decrypted packets, by IV mod slots.
+// 4096 covers about 0.4 s of shards at 150 Mbps, far more than the path lag.
+#define ML_SEEN_SLOTS 4096
+
 typedef struct _ML_BLOCK {
     bool used;
     bool resolved;      // merged queue completed it or moved on to a newer block
@@ -104,6 +108,8 @@ typedef struct _RTP_VIDEO_QUEUE {
     uint16_t mlSecondaryHigh;     // highest sequence number the secondary delivered
     bool mlDraining;
     uint32_t mlReplayRejected[2]; // held packets (counted as queued on arrival) rejected on replay, per path
+    uint64_t mlSeenKey[ML_SEEN_SLOTS]; // IV key + 1 of an authenticated packet; 0 = empty
+    uint16_t mlSeenSeq[ML_SEEN_SLOTS]; // its RTP sequence number
     RTPV_QUEUE_LIST mlHeld;       // later-block packets held in arrival order
     uint64_t mlHoldStartUs;
     uint32_t graceHeldPackets;    // packets held on arrival (re-holds during replay not counted)
@@ -128,3 +134,9 @@ void RtpvMultilinkFlush(PRTP_VIDEO_QUEUE queue);
 // copies stay eligible for ML_RING_BLOCKS frames so late ones are still observed.
 bool RtpvIsStaleFrame(PRTP_VIDEO_QUEUE queue, uint32_t frameNumber, int path, bool multilink);
 void RtpvGetStats(PRTP_VIDEO_QUEUE queue, PRTP_VIDEO_STATS stats);
+// Multilink: both paths carry the same encrypted packet, so an IV that already decrypted
+// successfully identifies a duplicate before decryption. Record only authenticated
+// packets, so a forged IV cannot suppress a genuine copy. SkipDuplicate returns true for
+// an already-decrypted IV and still feeds that copy to the per-path counters.
+void RtpvMultilinkRecordDecrypted(PRTP_VIDEO_QUEUE queue, uint64_t ivKey, uint16_t seq);
+bool RtpvMultilinkSkipDuplicate(PRTP_VIDEO_QUEUE queue, uint64_t ivKey, int path);

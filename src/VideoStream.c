@@ -25,7 +25,7 @@ static SOCKET secondarySocket = INVALID_SOCKET;
 static atomic_bool secondaryFailed;
 
 typedef struct {
-    uint64_t packets, bytes, decryptFailures, accepted, rejected;
+    uint64_t packets, bytes, decryptFailures, accepted, rejected, skipped;
 } PATH_STATS;
 static PATH_STATS pathStats[2];
 static uint64_t lastSummaryMs;
@@ -160,8 +160,8 @@ static const char* secondaryState(void) {
 static void logMultilinkSummary(const char* tag) {
     RTP_VIDEO_STATS stats;
     RtpvGetStats(&rtpQueue, &stats);
-    Limelog("multilink %s: p0 pkts=%llu bytes=%llu decfail=%llu first=%llu dup_late=%llu | "
-            "p1 pkts=%llu bytes=%llu decfail=%llu first=%llu dup_late=%llu | "
+    Limelog("multilink %s: p0 pkts=%llu bytes=%llu decfail=%llu first=%llu dup_late=%llu dup_skipped=%llu | "
+            "p1 pkts=%llu bytes=%llu decfail=%llu first=%llu dup_late=%llu dup_skipped=%llu | "
             "blocks_primary_alone_unrecoverable=%u blocks_rescued_by_secondary=%u blocks_failed_merged=%u blocks_unfinalized=%u | "
             "grace_held=%u grace_saved=%u grace_gave_up=%u | "
             "fec_recovered=%u fec_failed=%u oos=%u | "
@@ -171,10 +171,12 @@ static void logMultilinkSummary(const char* tag) {
             (unsigned long long)pathStats[0].decryptFailures,
             (unsigned long long)(pathStats[0].accepted - rtpQueue.mlReplayRejected[0]),
             (unsigned long long)(pathStats[0].rejected + rtpQueue.mlReplayRejected[0]),
+            (unsigned long long)pathStats[0].skipped,
             (unsigned long long)pathStats[1].packets, (unsigned long long)pathStats[1].bytes,
             (unsigned long long)pathStats[1].decryptFailures,
             (unsigned long long)(pathStats[1].accepted - rtpQueue.mlReplayRejected[1]),
             (unsigned long long)(pathStats[1].rejected + rtpQueue.mlReplayRejected[1]),
+            (unsigned long long)pathStats[1].skipped,
             rtpQueue.blocksPrimaryAloneUnrecoverable, rtpQueue.blocksRescuedBySecondary,
             rtpQueue.blocksFailedMerged, rtpQueue.blocksUnfinalized,
             rtpQueue.graceHeldPackets, rtpQueue.graceSavedBlocks, rtpQueue.graceGaveUpBlocks,
@@ -276,6 +278,7 @@ static void VideoReceiveThreadProc(void* context) {
     int path;
     SOCKET recvSocket;
     bool preferSecondary = false;
+    uint64_t ivKey = 0;
 
     encrypted = !!(EncryptionFeaturesEnabled & SS_ENC_VIDEO);
     decryptedSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
@@ -443,6 +446,20 @@ static void VideoReceiveThreadProc(void* context) {
         if (encrypted) {
             PENC_VIDEO_HEADER encHeader = (PENC_VIDEO_HEADER)encryptedBuffer;
 
+            // Multilink: skip decrypting the second copy of a packet. The host's IV is a
+            // per-packet counter (bytes 0-7 little-endian), so equal IVs mean the same packet.
+            if (secondarySocket != INVALID_SOCKET) {
+                ivKey = 0;
+                for (int i = 7; i >= 0; i--) {
+                    ivKey = (ivKey << 8) | encHeader->iv[i];
+                }
+                if (RtpvMultilinkSkipDuplicate(&rtpQueue, ivKey, path)) {
+                    pathStats[path].rejected++;
+                    pathStats[path].skipped++;
+                    continue;
+                }
+            }
+
             // If this frame is below our current frame number, discard it before decryption
             // to save CPU cycles decrypting FEC shards for a frame we already reassembled.
             //
@@ -494,6 +511,10 @@ static void VideoReceiveThreadProc(void* context) {
         packet->sequenceNumber = BE16(packet->sequenceNumber);
         packet->timestamp = BE32(packet->timestamp);
         packet->ssrc = BE32(packet->ssrc);
+
+        if (encrypted && secondarySocket != INVALID_SOCKET) {
+            RtpvMultilinkRecordDecrypted(&rtpQueue, ivKey, packet->sequenceNumber);
+        }
 
         queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize], path);
 
